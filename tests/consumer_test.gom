@@ -1,7 +1,8 @@
 package tests;
 
 use ecosystem::web::{Router, Headers, Response, Error, Event};
-use ecosystem::reqwest;
+use ecosystem::web::testing as web_testing;
+use ecosystem::request;
 use std::bytes::{Bytes};
 use std::testing;
 use std::serde::{Serialize, Deserialize};
@@ -15,7 +16,7 @@ struct Payload {
     values: Vec[u16],
 }
 
-fn exchange(client: reqwest::Client, base: string, index: isize) -> Result[Payload, reqwest::Error] {
+fn exchange(client: request::Client, base: string, index: isize) -> Result[Payload, request::Error] {
     client.post(base + "/typed").json(
         Payload {
             label: "client " + index.to_string(),
@@ -25,7 +26,7 @@ fn exchange(client: reqwest::Client, base: string, index: isize) -> Result[Paylo
 }
 
 #[test]
-fn independent_client_and_server_native_dependencies_compose() -> () {
+fn independent_goml_client_and_server_dependencies_compose() -> () {
     let router = Router::new().post(
         "/typed",
         |request| {
@@ -49,7 +50,7 @@ fn independent_client_and_server_native_dependencies_compose() -> () {
         testing::assert_ok(server.shutdown(time::Duration::from_seconds(2)));
     };
     let base = "http://" + testing::expect_ok(server.address(), "address");
-    let client = testing::expect_ok(reqwest::Client::new(), "client");
+    let client = testing::expect_ok(request::Client::new(), "client");
     defer client.close();
     task::scope(
         |scope| {
@@ -70,6 +71,27 @@ fn independent_client_and_server_native_dependencies_compose() -> () {
         testing::expect_ok(events.text(), "event text"),
         "data: first\n\ndata: 中😀\n\n",
     );
+}
+
+#[test]
+fn public_testing_server_and_recorder_support_external_clients() -> () {
+    let router = Router::new().get("/probe", |_| Result::Ok(Response::text(200, "ready")));
+    let recorder = web_testing::Recorder::new(router);
+    testing::assert_eq(
+        testing::expect_ok(
+            testing::expect_ok(recorder.request("GET", "/probe").send(), "record").text(),
+            "record text",
+        ),
+        "ready",
+    );
+    testing::assert_eq(recorder.exchanges().len(), 1);
+    let server = testing::expect_ok(web_testing::TestServer::start(router), "test server");
+    defer testing::assert_ok(server.shutdown(time::Duration::from_seconds(2)));
+    let client = testing::expect_ok(request::Client::new(), "client");
+    defer client.close();
+    let url = testing::expect_ok(server.url("/probe"), "probe URL");
+    let response = testing::expect_ok(client.get(url).send(), "HTTP request");
+    testing::assert_eq(testing::expect_ok(response.text(), "HTTP body"), "ready");
 }
 
 #[test]

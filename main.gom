@@ -1,6 +1,9 @@
 package main;
 
 use ecosystem::web::{Router, Headers, Response, Error, ErrorKind, Limits, Event};
+use ecosystem::web::testing as web_testing;
+use ecosystem::web::proxy;
+use ecosystem::request;
 use std::serde::{Serialize, Deserialize};
 use std::bytes::{Bytes};
 use std::env;
@@ -144,6 +147,35 @@ pub fn app() -> Router {
     )
 }
 
+pub fn proxy_smoke() -> () {
+    let backend = testing::expect_ok(
+        web_testing::TestServer::start(
+            Router::new().get("/base/ping", |_| Result::Ok(Response::text(200, "proxied"))),
+        ),
+        "backend server",
+    );
+    defer {
+        let _ = backend.shutdown(Duration::from_seconds(2));
+    };
+    let outbound = testing::expect_ok(request::Client::new(), "proxy client");
+    defer outbound.close();
+    let handler = testing::expect_ok(
+        proxy::Proxy::new(backend.base_url() + "/base", outbound, 1024, 1024),
+        "reverse proxy",
+    ).handler();
+    let frontend = testing::expect_ok(
+        web_testing::TestServer::start(Router::new().fallback(handler)),
+        "frontend server",
+    );
+    defer {
+        let _ = frontend.shutdown(Duration::from_seconds(2));
+    };
+    let client = testing::expect_ok(request::Client::new(), "request client");
+    defer client.close();
+    let reply = testing::expect_ok(client.get(frontend.base_url() + "/ping").send(), "proxy reply");
+    testing::assert_eq(testing::expect_ok(reply.text(), "proxy body"), "proxied");
+}
+
 fn main() -> () {
     let args = env::args();
     let router = app();
@@ -153,14 +185,22 @@ fn main() -> () {
         let _ = io::read_stdin_to_string();
         testing::expect_ok(server.shutdown(Duration::from_seconds(3)), "shutdown");
     } else {
+        let recorder = web_testing::Recorder::new(router);
         let reply = testing::expect_ok(
-            router.dispatch("GET", "/api/users/external", Headers::new(), Bytes::new()),
-            "dispatch",
+            recorder.request("GET", "/api/users/external").send(),
+            "recorded dispatch",
         );
         let value: Message = testing::expect_ok(reply.json(), "json");
         testing::assert_eq(value.name, "external");
-        let server = testing::expect_ok(router.serve("127.0.0.1:0"), "server");
+        testing::assert_eq(recorder.exchanges().len(), 1);
+        let failure = web_testing::FaultTransport::new(
+            router,
+            Vec::from_array([web_testing::Fault::Reject(ErrorKind::Transport)]),
+        );
+        testing::assert_err(failure.dispatch("GET", "/", Headers::new(), Bytes::new()));
+        let server = testing::expect_ok(web_testing::TestServer::start(router), "server");
         testing::expect_ok(server.shutdown(Duration::from_seconds(1)), "shutdown");
+        proxy_smoke();
         println(
             "web independent consumer: routing, typed JSON, middleware and server lifecycle passed",
         );
