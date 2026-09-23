@@ -17,7 +17,7 @@ Declare a versioned dependency:
 "ecosystem::web" = "0.1.0"
 ```
 
-Consumers do not need a native dependency declaration or handwritten Go `require` or `replace` entries. The independent consumer under `../consumers/web` exercises the versioned dependency boundary.
+Consumers do not need a native dependency declaration or handwritten Go `require` or `replace` entries. The independent consumer under `../../goml-dev/ecosystem/consumers/web` exercises the versioned dependency boundary.
 
 ```goml
 use ecosystem::web::{Router, Response};
