@@ -17,7 +17,7 @@ Declare a versioned dependency:
 "ecosystem::web" = "0.1.0"
 ```
 
-Consumers do not need a native dependency declaration or handwritten Go `require` or `replace` entries. The independent consumer under `../../goml-dev/ecosystem/consumers/web` exercises the versioned dependency boundary.
+Consumers do not need a native dependency declaration or handwritten Go `require` or `replace` entries. The independent consumer under `consumer` exercises the versioned dependency boundary.
 
 ```goml
 use ecosystem::web::{Router, Response};
@@ -96,10 +96,10 @@ for body limits, response mapping and unsupported upgrade/streaming cases.
 
 The current listener serves plain HTTP/1.1 and HTTP/1.0 over TCP. TLS termination, HTTP/2, HTTP/3, WebSocket upgrades, multipart extraction, static file serving, compression negotiation and CORS are not bundled. They can be implemented as later transport or middleware additions. The library deliberately reserves transport framing headers and does not expose connection hijacking.
 
-Run from the repository root:
+Run from this library repository:
 
 ```sh
-just ecosystem-test web
+(cd ../verification && just ecosystem-test web)
 ```
 
 GoML black-box tests, versioned-consumer tests and cached rebuild checks cover
