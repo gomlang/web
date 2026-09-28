@@ -1,0 +1,173 @@
+package web;
+
+pub struct Cors {
+    origins: Vec[string],
+    methods: Vec[string],
+    headers: Vec[string],
+    exposed: Vec[string],
+    credentials: bool,
+    max_age: u32,
+}
+
+fn vary_header(response: Response, name: string) -> Response {
+    for value in response.headers().get_all("vary") {
+        for field in value.split(",") {
+            if field.trim() == "*" || field.trim().eq_ignore_ascii_case(name) {
+                return response
+            }
+        }
+    }
+    response.append_header("vary", name)
+}
+
+fn header_names(values: Vec[string]) -> Result[Vec[string], Error] {
+    let result: Vec[string] = Vec::new();
+    for value in values {
+        let value = value.trim().to_ascii_lowercase();
+        if !token(value) || value == "*" {
+            return Result::Err(
+                Error::new(ErrorKind::Configuration, "expected an explicit HTTP header name"),
+            )
+        }
+        if !result.contains(value) {
+            result.push(value)
+        }
+    }
+    Result::Ok(result)
+}
+
+impl Cors {
+    pub fn new(origins: Vec[string]) -> Cors {
+        Cors {
+            origins: origins.copy(),
+            methods: Vec::from_array(["GET", "HEAD", "POST"]),
+            headers: Vec::new(),
+            exposed: Vec::new(),
+            credentials: false,
+            max_age: 600,
+        }
+    }
+
+    pub fn allow_methods(self: Cors, methods: Vec[string]) -> Cors {
+        Cors { methods: methods.copy(), ..self }
+    }
+
+    pub fn allow_headers(self: Cors, headers: Vec[string]) -> Cors {
+        Cors { headers: headers.copy(), ..self }
+    }
+
+    pub fn expose_headers(self: Cors, headers: Vec[string]) -> Cors {
+        Cors { exposed: headers.copy(), ..self }
+    }
+
+    pub fn allow_credentials(self: Cors, enabled: bool) -> Cors {
+        Cors { credentials: enabled, ..self }
+    }
+
+    pub fn max_age(self: Cors, seconds: u32) -> Cors {
+        Cors { max_age: seconds, ..self }
+    }
+
+    pub fn layer(self: Cors) -> Result[Middleware, Error] {
+        if self.credentials && self.origins.contains("*") {
+            return Result::Err(
+                Error::new(ErrorKind::Configuration, "credentialed CORS requires explicit origins"),
+            )
+        }
+        for origin in self.origins {
+            let _ = Headers::new().append("origin", origin)?;
+            if origin == "" || origin.contains(" ") || origin.contains("\t") || origin.contains(",") {
+                return Result::Err(Error::new(ErrorKind::Configuration, "invalid CORS origin"))
+            }
+        }
+        if self.methods.is_empty() {
+            return Result::Err(Error::new(ErrorKind::Configuration, "CORS methods cannot be empty"))
+        }
+        for method in self.methods {
+            if !token(method) || method == "*" || method != method.to_ascii_uppercase() {
+                return Result::Err(
+                    Error::new(
+                        ErrorKind::Configuration,
+                        "CORS methods must be explicit uppercase tokens",
+                    ),
+                )
+            }
+        }
+        let policy = Cors {
+            headers: header_names(self.headers)?,
+            exposed: header_names(self.exposed)?,
+            ..self,
+        };
+        Result::Ok(|request: Request, next: Next| policy.apply(request, next))
+    }
+
+    fn apply(self: Cors, request: Request, next: Next) -> Result[Response, Error] {
+        let headers = request.headers();
+        let origins = headers.get_all("origin");
+        if origins.is_empty() {
+            return next.run(request).map(|response| vary_header(response, "Origin"))
+        }
+        let preflight = request.method() == "OPTIONS"
+            && headers.get("access-control-request-method").is_some();
+        if origins.len() != 1 || !(self.origins.contains("*") || self.origins.contains(origins[0])) {
+            return Result::Ok(vary_header(Response::text(403, "origin is not allowed"), "Origin"))
+        }
+        let mut response = if preflight {
+            let methods = headers.get_all("access-control-request-method");
+            let allowed = methods.len() == 1 && self.methods.contains(methods[0]);
+            let mut allowed_headers = true;
+            for value in headers.get_all("access-control-request-headers") {
+                for name in value.split(",") {
+                    let name = name.trim().to_ascii_lowercase();
+                    if !token(name) || !self.headers.contains(name) {
+                        allowed_headers = false;
+                    }
+                }
+            }
+            if !allowed || !allowed_headers {
+                return Result::Ok(
+                    vary_header(
+                        vary_header(
+                            vary_header(
+                                Response::text(403, "CORS preflight is not allowed"),
+                                "Origin",
+                            ),
+                            "Access-Control-Request-Method",
+                        ),
+                        "Access-Control-Request-Headers",
+                    ),
+                )
+            }
+            let response = Response::new(204).header(
+                "access-control-allow-methods",
+                self.methods.join(", "),
+            ).header("access-control-max-age", self.max_age.to_string());
+            let response = if self.headers.is_empty() {
+                response
+            } else {
+                response.header("access-control-allow-headers", self.headers.join(", "))
+            };
+            vary_header(
+                vary_header(response, "Access-Control-Request-Method"),
+                "Access-Control-Request-Headers",
+            )
+        } else {
+            next.run(request)?
+        };
+        response = vary_header(response, "Origin").header(
+            "access-control-allow-origin",
+            if self.origins.contains("*") {
+                "*"
+            } else {
+                origins[0]
+            },
+        );
+        if self.credentials {
+            response = response.header("access-control-allow-credentials", "true");
+        }
+        if !preflight && !self.exposed.is_empty() {
+            response = response.header("access-control-expose-headers", self.exposed.join(", "));
+        }
+        Result::Ok(response)
+    }
+}

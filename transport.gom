@@ -75,19 +75,33 @@ struct InputCursor {
 }
 
 struct Input {
+    contextual_reader: Option[(context::Context) -> Result[Bytes, Error]],
     reader: () -> Result[Bytes, Error],
     cursor: Ref[InputCursor],
 }
 
 impl Input {
     fn new(reader: () -> Result[Bytes, Error]) -> Input {
-        Input { reader, cursor: Ref::new(InputCursor { data: Bytes::new(), offset: 0 }) }
+        Input {
+            contextual_reader: Option::None,
+            reader,
+            cursor: Ref::new(InputCursor { data: Bytes::new(), offset: 0 }),
+        }
     }
 
     fn take(self: Input, maximum: isize) -> Result[Bytes, Error] {
+        self.take_with(maximum, context::Context::background())
+    }
+
+    fn take_with(self: Input, maximum: isize, context: context::Context) -> Result[Bytes, Error] {
+        context.check().map_err(context_error)?;
         let mut cursor = self.cursor.get();
         if cursor.offset == cursor.data.len() {
-            cursor = InputCursor { data: (self.reader)()?, offset: 0 };
+            let data = match self.contextual_reader {
+                Some(reader) => reader(context)?,
+                None => (self.reader)()?,
+            };
+            cursor = InputCursor { data, offset: 0 };
             if cursor.data.is_empty() {
                 return Result::Err(bad_request("unexpected end of HTTP input"))
             }
@@ -125,22 +139,21 @@ impl Input {
     }
 }
 
-fn socket_read(stream: TcpStream, context: context::Context) -> Result[Bytes, Error] {
+fn socket_read(stream: ConnectionStream, context: context::Context) -> Result[Bytes, Error] {
     let data: Vec[byte] = Vec::with_capacity(16384);
     for _ in 0..16384 {
         data.push(0);
     }
-    let count = stream.read_with(data.as_mut_slice(), WaitOptions::new().with_context(context)).map_err(
-        transport_error,
-    )?;
+    let count = stream.read_with(data.as_mut_slice(), context).map_err(transport_error)?;
     data.truncate(count);
     Result::Ok(Bytes::from_vec(data))
 }
 
-fn socket_write(stream: TcpStream, context: context::Context, data: Bytes) -> Result[(), Error] {
-    stream.write_all_with(data.as_slice(), WaitOptions::new().with_context(context)).map_err(
-        transport_error,
-    )
+fn socket_write(stream: ConnectionStream, context: context::Context, data: Bytes) -> Result[
+    (),
+    Error,
+] {
+    stream.write_all_with(data.as_slice(), context).map_err(transport_error)
 }
 
 struct BodyCursor {
@@ -383,6 +396,7 @@ fn read_head(input: Input, limits: Limits) -> Result[Head, Error] {
 
 fn make_request(head: Head, body: BodyState, lifetime: Lifetime, remote: string, limits: Limits) -> Request {
     Request {
+        http11_value: head.http11,
         lifetime,
         body_value: Body { state: body },
         remote_value: remote,
@@ -401,7 +415,7 @@ fn make_request(head: Head, body: BodyState, lifetime: Lifetime, remote: string,
 struct Output {
     lifetime: Lifetime,
     gate: Channel[()],
-    stream: Option[TcpStream],
+    stream: Option[ConnectionStream],
     captured: Bytes,
     limit: isize,
     chunked: bool,
@@ -528,12 +542,21 @@ fn dispatch(router: Router, method: string, target: string, headers: Headers, bo
                 http11: true,
             };
             let input = Input {
+                contextual_reader: Option::None,
                 reader: || Result::Ok(Bytes::new()),
                 cursor: Ref::new(InputCursor { data: body.copy(), offset: 0 }),
             };
             let state = BodyState::new(input, lifetime, body.len(), false, limits);
             let request = make_request(head, state, lifetime, "", limits);
             let response = response_for(router, request)?;
+            if response.upgrade_value.is_some() {
+                return Result::Err(
+                    Error::new(
+                        ErrorKind::Configuration,
+                        "WebSocket upgrades require a network connection",
+                    ),
+                )
+            }
             let output = Output {
                 lifetime,
                 gate: gate(),

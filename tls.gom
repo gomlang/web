@@ -1,0 +1,272 @@
+package web;
+
+use std::bytes::{Bytes};
+use std::context;
+use std::ffi;
+use std::io;
+use std::net::{TcpListener, TcpStream, WaitOptions};
+use std::net::tls;
+use std::task;
+use std::time::{Duration};
+
+#[go_type("example.com/goml-ecosystem/web/adapter", "ListenerHandle")]
+extern type TlsListener;
+
+#[go_type("example.com/goml-ecosystem/web/adapter", "StreamHandle")]
+extern type TlsConnection;
+
+#[go_ffi("example.com/goml-ecosystem/web/adapter", "Listen")]
+extern fn tls_listen(address: string, certificate: Slice[byte], key: Slice[byte], minimum: u16) -> (
+    TlsListener,
+    ffi::Error,
+);
+
+#[go_ffi("example.com/goml-ecosystem/web/adapter", "Accept")]
+extern fn tls_accept(listener: TlsListener) -> (TlsConnection, string, ffi::Error);
+
+#[go_ffi("example.com/goml-ecosystem/web/adapter", "ListenerAddress")]
+extern fn tls_address(listener: TlsListener) -> string;
+
+#[go_ffi("example.com/goml-ecosystem/web/adapter", "ListenerClose")]
+extern fn tls_listener_close(listener: TlsListener) -> ffi::Error;
+
+#[go_ffi("example.com/goml-ecosystem/web/adapter", "Handshake")]
+extern fn tls_handshake(stream: TlsConnection, timeout: i64) -> ffi::Error;
+
+#[go_ffi("example.com/goml-ecosystem/web/adapter", "Read")]
+extern fn tls_read(stream: TlsConnection, buffer: MutSlice[byte], timeout: i64) -> (
+    isize,
+    ffi::Error,
+);
+
+#[go_ffi("example.com/goml-ecosystem/web/adapter", "Write")]
+extern fn tls_write(stream: TlsConnection, buffer: Slice[byte], timeout: i64) -> (isize, ffi::Error);
+
+#[go_ffi("example.com/goml-ecosystem/web/adapter", "Close")]
+extern fn tls_close(stream: TlsConnection) -> ffi::Error;
+
+#[go_ffi("example.com/goml-ecosystem/web/adapter", "IsTimeout")]
+extern fn tls_timeout(error: ffi::Error) -> bool;
+
+pub struct TlsConfig {
+    certificate: Bytes,
+    private_key: Bytes,
+    minimum: tls::Version,
+    handshake_timeout: Duration,
+}
+
+impl TlsConfig {
+    pub fn new(certificate_pem: Bytes, private_key_pem: Bytes) -> TlsConfig {
+        TlsConfig {
+            certificate: certificate_pem.copy(),
+            private_key: private_key_pem.copy(),
+            minimum: tls::Version::Tls12,
+            handshake_timeout: Duration::from_seconds(10),
+        }
+    }
+
+    pub fn with_minimum_version(self: TlsConfig, minimum: tls::Version) -> TlsConfig {
+        TlsConfig { minimum, ..self }
+    }
+
+    pub fn with_handshake_timeout(self: TlsConfig, timeout: Duration) -> TlsConfig {
+        TlsConfig { handshake_timeout: timeout, ..self }
+    }
+}
+
+fn tls_error(value: ffi::Error, operation: string) -> Result[(), io::Error] {
+    let Some(error) = ffi::NonNilError::from_error(value) else {
+        return Result::Ok(())
+    };
+    Result::Err(
+        io::Error::new(
+            if tls_timeout(value) {
+                io::ErrorKind::TimedOut
+            } else {
+                io::ErrorKind::Other
+            },
+            operation,
+            Option::None,
+            Option::None,
+            error.message().unwrap_or("TLS operation failed"),
+        ),
+    )
+}
+
+fn tls_remaining(context: context::Context) -> i64 {
+    context.remaining().map(|duration| duration.as_nanoseconds()).unwrap_or(-1)
+}
+
+fn tls_operation[T](
+    stream: TlsConnection,
+    context: context::Context,
+    operation: string,
+    body: () -> Result[T, io::Error],
+) -> Result[T, io::Error] {
+    context.check().map_err(|error| io_error(context_error(error), operation))?;
+    if context.token().is_none() {
+        return body()
+    }
+    task::scope(
+        |scope| {
+            defer scope.cancel();
+            let _ = scope.spawn(
+                |token| {
+                    select {
+                        recv(context.done()) as _ => {
+                            let _ = tls_close(stream);
+                        },
+                        recv(token.done()) as _ => (),
+                    }
+                },
+            );
+            let result = body();
+            context.check().map_err(|error| io_error(context_error(error), operation))?;
+            result
+        },
+    )
+}
+
+enum ServerListener {
+    Tcp(TcpListener),
+    Tls(TlsListener, Duration),
+}
+
+enum ConnectionStream {
+    Tcp(TcpStream),
+    Tls(TlsConnection, Duration),
+}
+
+impl ServerListener {
+    fn address(self: ServerListener) -> Result[string, Error] {
+        match self {
+            Tcp(listener) => listener.local_addr().map(|address| address.to_string()).map_err(
+                transport_error,
+            ),
+            Tls(listener, _) => Result::Ok(tls_address(listener)),
+        }
+    }
+
+    fn close(self: ServerListener) -> Result[(), io::Error] {
+        match self {
+            Tcp(listener) => listener.close(),
+            Tls(listener, _) => tls_error(tls_listener_close(listener), "TLS listener close"),
+        }
+    }
+
+    fn accept(self: ServerListener) -> Result[(ConnectionStream, string), Error] {
+        match self {
+            Tcp(listener) => listener.accept().map(
+                |pair| (ConnectionStream::Tcp(pair.0), pair.1.to_string()),
+            ).map_err(transport_error),
+            Tls(listener, timeout) => {
+                let (stream, address, error) = tls_accept(listener);
+                tls_error(error, "TLS accept").map_err(transport_error)?;
+                Result::Ok((ConnectionStream::Tls(stream, timeout), address))
+            },
+        }
+    }
+}
+
+impl ConnectionStream {
+    fn handshake(self: ConnectionStream) -> Result[(), Error] {
+        match self {
+            Tcp(_) => Result::Ok(()),
+            Tls(stream, timeout) => tls_error(
+                tls_handshake(stream, timeout.as_nanoseconds()),
+                "TLS handshake",
+            ).map_err(transport_error),
+        }
+    }
+
+    fn close(self: ConnectionStream) -> Result[(), io::Error] {
+        match self {
+            Tcp(stream) => stream.close(),
+            Tls(stream, _) => tls_error(tls_close(stream), "TLS close"),
+        }
+    }
+
+    fn read_with(self: ConnectionStream, data: MutSlice[byte], context: context::Context) -> Result[
+        isize,
+        io::Error,
+    ] {
+        context.check().map_err(|error| io_error(context_error(error), "read connection"))?;
+        match self {
+            Tcp(stream) => stream.read_with(data, WaitOptions::new().with_context(context)),
+            Tls(stream, _) => tls_operation(
+                stream,
+                context,
+                "TLS read",
+                || {
+                    let (count, error) = tls_read(stream, data, tls_remaining(context));
+                    if count == 0 {
+                        tls_error(error, "TLS read")?;
+                    }
+                    Result::Ok(count)
+                },
+            ),
+        }
+    }
+
+    fn write_with(self: ConnectionStream, data: Slice[byte], context: context::Context) -> Result[
+        isize,
+        io::Error,
+    ] {
+        context.check().map_err(|error| io_error(context_error(error), "write connection"))?;
+        match self {
+            Tcp(stream) => stream.write_with(data, WaitOptions::new().with_context(context)),
+            Tls(stream, _) => tls_operation(
+                stream,
+                context,
+                "TLS write",
+                || {
+                    let (count, error) = tls_write(stream, data, tls_remaining(context));
+                    tls_error(error, "TLS write")?;
+                    Result::Ok(count)
+                },
+            ),
+        }
+    }
+
+    fn write_all_with(self: ConnectionStream, data: Slice[byte], context: context::Context) -> Result[
+        (),
+        io::Error,
+    ] {
+        let mut offset = 0;
+        while offset < data.len() {
+            let count = self.write_with(data.sub(offset, data.len()), context)?;
+            if count == 0 {
+                return Result::Err(
+                    io_error(
+                        Error::new(ErrorKind::Transport, "connection write made no progress"),
+                        "write connection",
+                    ),
+                )
+            }
+            offset += count;
+        }
+        Result::Ok(())
+    }
+}
+
+impl Router {
+    pub fn serve_tls(self: Router, address: string, config: TlsConfig) -> Result[Server, Error] {
+        self.validate()?;
+        if config.handshake_timeout.is_zero() {
+            return Result::Err(
+                Error::new(ErrorKind::Configuration, "TLS handshake timeout must be positive"),
+            )
+        }
+        let (listener, error) = tls_listen(
+            listen_address(address)?.to_string(),
+            config.certificate.as_slice(),
+            config.private_key.as_slice(),
+            match config.minimum {
+                Tls12 => 771,
+                Tls13 => 772,
+            },
+        );
+        tls_error(error, "TLS listen").map_err(transport_error)?;
+        start_listener(self, ServerListener::Tls(listener, config.handshake_timeout))
+    }
+}

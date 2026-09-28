@@ -8,7 +8,7 @@ use std::time::{Duration, Timer};
 
 struct Connection {
     id: isize,
-    stream: TcpStream,
+    stream: ConnectionStream,
     active: bool,
     cancel: Option[context::CancelHandle],
 }
@@ -21,7 +21,7 @@ struct ServerState {
 }
 
 pub struct Server {
-    listener: TcpListener,
+    listener: ServerListener,
     address_value: string,
     state: Channel[ServerState],
     changed: Channel[()],
@@ -223,11 +223,16 @@ fn listen_address(address: string) -> Result[SocketAddr, Error] {
 #[allow(unstructured_go)]
 fn start(router: Router, address: string) -> Result[Server, Error] {
     let listener = TcpListener::bind(listen_address(address)?).map_err(transport_error)?;
-    let address_value = match listener.local_addr() {
-        Ok(address) => address.to_string(),
+    start_listener(router, ServerListener::Tcp(listener))
+}
+
+#[allow(unstructured_go)]
+fn start_listener(router: Router, listener: ServerListener) -> Result[Server, Error] {
+    let address_value = match listener.address() {
+        Ok(address) => address,
         Err(error) => {
             let _ = listener.close();
-            return Result::Err(transport_error(error))
+            return Result::Err(error)
         },
     };
     let state = Channel::new(1);
@@ -268,12 +273,9 @@ fn accept_connections(server: Server, router: Router) -> () {
         };
         if state.connections.len() >= connection_limit {
             server.state.send(state);
-            let _ = stream.write_all_with(
-                Bytes::from_string(
-                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                ).as_slice(),
-                WaitOptions::new().with_timeout(Duration::from_milliseconds(100)),
-            );
+            if let ConnectionStream::Tcp(_) = stream {
+                send_busy(stream);
+            }
             let _ = stream.close();
             continue
         }
@@ -285,7 +287,9 @@ fn accept_connections(server: Server, router: Router) -> () {
             defer {
                 let _ = stream.close();
             };
-            serve_connection(server, id, router, stream, remote.to_string());
+            if stream.handshake().is_ok() {
+                serve_connection(server, id, router, stream, remote);
+            }
         };
     }
 }
@@ -345,17 +349,37 @@ fn response_head(response: Response, chunked: bool, close: bool) -> Bytes {
     )
 }
 
-fn send_error(stream: TcpStream, error: Error, head: bool) -> () {
+fn send_busy(stream: ConnectionStream) -> () {
+    context::with_timeout(
+        context::Context::background(),
+        Duration::from_milliseconds(100),
+        |context, _| {
+            let _ = socket_write(
+                stream,
+                context,
+                Bytes::from_string(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ),
+            );
+        },
+    );
+}
+
+fn send_error(stream: ConnectionStream, error: Error, head: bool) -> () {
     let response = error.response();
-    let options = WaitOptions::new().with_timeout(Duration::from_milliseconds(100));
-    if stream.write_all_with(response_head(response, false, true).as_slice(), options).is_ok()
-        && !head {
-        let _ = stream.write_all_with(response.bytes_value.as_slice(), options);
-    }
+    context::with_timeout(
+        context::Context::background(),
+        Duration::from_milliseconds(100),
+        |context, _| {
+            if socket_write(stream, context, response_head(response, false, true)).is_ok() && !head {
+                let _ = socket_write(stream, context, response.bytes_value);
+            }
+        },
+    );
 }
 
 fn pump(
-    stream: TcpStream,
+    stream: ConnectionStream,
     lifetime: Lifetime,
     cancel: context::CancelHandle,
     chunks: Channel[Result[Bytes, Error]],
@@ -383,28 +407,39 @@ fn pump(
     }
 }
 
+fn queued_read(
+    chunks: Channel[Result[Bytes, Error]],
+    context: context::Context,
+    call: context::Context,
+) -> Result[Bytes, Error] {
+    context.check().map_err(context_error)?;
+    call.check().map_err(context_error)?;
+    select {
+        recv(chunks) as value => value.unwrap_or(Result::Err(closed_error())),
+        recv(context.done()) as _ => Result::Err(
+            context_error(context.error().unwrap_or(context::Error::Cancelled)),
+        ),
+        recv(call.done()) as _ => Result::Err(
+            context_error(call.error().unwrap_or(context::Error::Cancelled)),
+        ),
+    }
+}
+
 fn queued_input(
     chunks: Channel[Result[Bytes, Error]],
     cursor: Ref[InputCursor],
     context: context::Context,
 ) -> Input {
     Input {
-        reader: || {
-            context.check().map_err(context_error)?;
-            select {
-                recv(chunks) as value => value.unwrap_or(Result::Err(closed_error())),
-                recv(context.done()) as _ => Result::Err(
-                    context_error(context.error().unwrap_or(context::Error::Cancelled)),
-                ),
-            }
-        },
+        contextual_reader: Option::Some(|call| queued_read(chunks, context, call)),
+        reader: || queued_read(chunks, context, context::Context::background()),
         cursor,
     }
 }
 
 fn serve_request(
     router: Router,
-    stream: TcpStream,
+    stream: ConnectionStream,
     remote: string,
     head: Head,
     input: Input,
@@ -430,6 +465,10 @@ fn serve_request(
     };
     if let Err(error) = lifetime.check() {
         send_error(stream, error, head.method == "HEAD");
+        return false
+    }
+    if let Some(upgrade) = response.upgrade_value {
+        let _ = serve_websocket(upgrade, response.headers_value, stream, input, context);
         return false
     }
     let chunked = response.stream_value.is_some() && head.method != "HEAD" && head.http11;
@@ -465,7 +504,13 @@ fn serve_request(
 }
 
 #[allow(unstructured_go)]
-fn serve_connection(server: Server, id: isize, router: Router, stream: TcpStream, remote: string) -> () {
+fn serve_connection(
+    server: Server,
+    id: isize,
+    router: Router,
+    stream: ConnectionStream,
+    remote: string,
+) -> () {
     let limits = router.limits_value;
     context::with_cancel(
         context::Context::background(),
@@ -513,12 +558,7 @@ fn serve_connection(server: Server, id: isize, router: Router, stream: TcpStream
                     },
                 };
                 if !server.admit(id, limits.concurrent_requests) {
-                    let _ = stream.write_all_with(
-                        Bytes::from_string(
-                            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        ).as_slice(),
-                        WaitOptions::new().with_timeout(Duration::from_milliseconds(100)),
-                    );
+                    send_busy(stream);
                     return
                 }
                 let keepalive = context::with_timeout(

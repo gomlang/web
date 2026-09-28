@@ -1,6 +1,6 @@
 # web
 
-`ecosystem::web` is a pure GoML HTTP server framework with routing, typed extraction, middleware, response construction and server-sent events. HTTP parsing, TCP transport, body streams, deadlines and server shutdown use `std::net` and `std::context`. There are no Go adapters, native module dependencies or cgo requirements.
+`ecosystem::web` is an HTTP server framework with GoML routing, typed extraction, middleware, response construction and server-sent events. HTTP parsing, TCP transport, body streams, deadlines and server shutdown use `std::net` and `std::context`. The TLS listener uses a managed Go standard-library adapter; no cgo or third-party Go dependencies are required.
 
 The design takes inspiration from [Axum](https://docs.rs/axum/latest/axum/). It adapts the handler model to GoML closures and garbage collection, rather than reproducing Rust ownership or async futures. The transport supports HTTP/1.1 keepalive, chunked bodies, pipelined requests and `100 Continue`.
 
@@ -17,7 +17,7 @@ Declare a versioned dependency:
 "ecosystem::web" = "0.1.0"
 ```
 
-Consumers do not need a native dependency declaration or handwritten Go `require` or `replace` entries. The independent consumer under `consumer` exercises the versioned dependency boundary.
+Consumers supply a minimal `go.mod`, as shown in `consumer/go.mod`. They do not need a native dependency declaration or handwritten Go `require` or `replace` entries. The independent consumer under `consumer` exercises the dependency boundary.
 
 ```goml
 use ecosystem::web::{Router, Response};
@@ -69,6 +69,30 @@ SSE supports event name, ID, retry milliseconds and multiline UTF-8 data. CRLF/C
 
 A request remains active until its response producer finishes. Body/request/writer aliases become invalid after dispatch ends, and late operations return `Closed`. Request-body reads and response writes are serialized internally. A client disconnect cancels `Request::wait`, subsequent body operations and writes. Finite streams and cancellation-aware loops should finish their own work before returning; the framework does not join arbitrary goroutines spawned by application code.
 
+## Multipart uploads
+
+`request.multipart(ecosystem::mime::multipart::Limits::standard())` opens a bounded, incremental form-data reader. Call `next_field()` for each field; its public metadata includes `name`, optional `filename`, optional `content_type`, and headers. `field.read(maximum)` reads at most 65536 bytes, while `field.collect(limit)` explicitly buffers a bounded field. Moving to the next field drains unread data under the same limits and invalidates the previous handle. Handles also expire when the request ends. Filenames are metadata; applications choose their own storage names and paths.
+
+Declare `ecosystem::mime` as a direct dependency when configuring multipart limits. Part count, header sizes, individual part bytes and total bytes have independent limits in addition to the router's request-body limit. Invalid dispositions and transfer encodings return 400; exceeded multipart limits return 413. The reader does not write temporary files.
+
+## Static files and middleware
+
+```goml
+let files = StaticFiles::new("public", 8 * 1024 * 1024)?;
+let router = Router::new().get("/assets/{*path}", files.handler("path"))
+    .layer(Cors::new(Vec::from_array(["https://example.com"]))
+        .allow_methods(Vec::from_array(["GET", "POST"]))
+        .allow_headers(Vec::from_array(["content-type"]))
+        .layer()?)
+    .layer(compression(1024 * 1024)?);
+```
+
+Import `StaticFiles`, `Cors` and `compression` from `ecosystem::web`. Close the static root with `files.close()` after the server has shut down. Files are read under the configured byte bound, with MIME types, SHA-256 ETags, conditional GET/HEAD and a single byte range. There is no directory listing or implicit index file. Descriptor-relative opening rejects symlinks, dotfiles and traversal components, including decoded route captures; only regular files are served. The implementation uses the existing Linux file-descriptor API.
+
+`Cors` validates explicit origins, methods and headers, handles preflight requests, and maintains `Vary: Origin`. Builders also configure exposed headers, credentials and preflight cache age. Credentialed requests require explicit origins; a wildcard origin cannot enable credentials. Disallowed origins, methods and requested headers receive 403.
+
+`compression(max_bytes)` negotiates gzip and identity using `Accept-Encoding` quality values. It compresses buffered responses within the bound, preserves `Vary`, weakens representation ETags, and removes obsolete content digests. Existing encodings, range responses, upgrades, streams/SSE and `Cache-Control: no-transform` remain outside compression. If no available representation is acceptable it returns 406. Streaming responses retain their existing bounded transport behavior.
+
 ## Limits, deadlines and shutdown
 
 `Limits::new` sets a 1 MiB request body limit, 1 MiB extraction limit, 1024 query/form fields, 4 MiB captured response limit, 30-second total request timeout, 5-second header timeout, 32 KiB header limit and 256 concurrent requests. `header_bytes` is an exact bound including the request line, CRLF delimiters and final empty line; trailers have a separate bound of the same size. Both known-length and chunked bodies are checked. Ambiguous Content-Length/Transfer-Encoding framing, duplicate framing headers, invalid header names and control-byte injection are rejected. Concurrent admission rejects excess requests with 503 without building an unbounded wait queue. Idle keepalive connections do not occupy request slots; accepted connections have a separate cap of `concurrent_requests + 256`. Idle connections expire after 60 seconds.
@@ -94,7 +118,7 @@ for body limits, response mapping and unsupported upgrade/streaming cases.
 
 ## Scope and verification
 
-The current listener serves plain HTTP/1.1 and HTTP/1.0 over TCP. TLS termination, HTTP/2, HTTP/3, WebSocket upgrades, multipart extraction, static file serving, compression negotiation and CORS are not bundled. They can be implemented as later transport or middleware additions. The library deliberately reserves transport framing headers and does not expose connection hijacking.
+The listener serves HTTP/1.1 and HTTP/1.0 over TCP or TLS. HTTP/2 and HTTP/3 remain unsupported. WebSocket upgrade is an explicit response operation; arbitrary connection hijacking is not exposed. Multipart, static files, CORS and buffered gzip compression have the bounds described above.
 
 Run from this library repository:
 
@@ -113,3 +137,38 @@ are tested over actual loopback connections. GoML TCP tests cover early stream
 arrival, backpressure, admission, idle keepalive, graceful/forced shutdown,
 request framing, panic isolation, deferred cleanup and transport failures. The shared verifier runs generated tests
 under the race detector.
+
+### TLS listeners
+
+`Router::serve_tls(address, TlsConfig::new(certificate_pem, private_key_pem))` starts an HTTPS listener with the same routing, streaming responses, limits and graceful shutdown behavior as `serve`. PEM inputs are `std::bytes::Bytes`; invalid certificates and keys fail before a listener is published. `with_minimum_version(tls::Version::Tls13)` raises the default TLS 1.2 minimum. `with_handshake_timeout(Duration)` controls each connection's positive handshake deadline (default ten seconds). Handshakes run per connection, so a stalled client does not block acceptance of other clients. ALPN advertises `http/1.1`.
+
+The TLS transport uses this module's Go standard-library adapter in `adapter/`; HTTP parsing and routing remain GoML code. Cancelling a context during a TLS read or write closes that connection and interrupts blocked transport work. Go 1.26 is required, with no cgo or third-party Go dependencies. The manifest's `[native]` declaration lets the driver select the adapter through a generated module file. Consumers must supply a minimal `go.mod`, as shown in `consumer/go.mod`; the driver leaves that file unchanged. The native transport's race tests run with `go test -race ./adapter`.
+
+### WebSocket upgrades
+
+Use `Response::websocket(request, selected_protocol, websocket::Limits::standard(), handler)` in a route. It validates an HTTP/1.1 GET handshake and returns a `101` response. `selected_protocol` is an optional offered subprotocol. Applications can inspect `request.websocket(limit)` to authorize the target, origin and proposed protocols before accepting the upgrade.
+
+```goml
+use ecosystem::web;
+use ecosystem::websocket;
+
+fn routes() -> web::Router {
+    web::Router::new().get("/socket", |request| {
+        web::Response::websocket(
+            request,
+            Option::None,
+            websocket::Limits::standard(),
+            |connection, context| {
+                let message = connection.receive(context).map_err(
+                    |error| web::Error::new(web::ErrorKind::Transport, error.message),
+                )?;
+                connection.send(message, context).map_err(
+                    |error| web::Error::new(web::ErrorKind::Transport, error.message),
+                )
+            },
+        )
+    })
+}
+```
+
+The handler receives the existing WebSocket connection API and a request context. Frames already buffered after HTTP headers are preserved. The handler runs within the configured request timeout, participates in graceful shutdown, and its connection closes when it returns or panics. Choose a suitable `Limits.request_timeout` for long sessions. Both TCP and TLS listeners support upgrades. HTTP dispatch/recording without a live connection rejects an upgrade, and upgrade responses cannot carry ordinary response bodies. WebSocket extensions are not negotiated.

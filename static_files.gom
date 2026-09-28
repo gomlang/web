@@ -1,0 +1,222 @@
+package web;
+
+use std::bytes::{Bytes};
+use std::crypto::hash;
+use std::io;
+use std::num;
+use std::os::linux::fd;
+
+pub struct StaticFiles {
+    root: fd::Fd,
+    max_bytes: isize,
+}
+
+fn static_media_type(name: string) -> string {
+    let name = name.to_ascii_lowercase();
+    let parts = name.split(".");
+    match parts[parts.len() - 1] {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json",
+        "txt" => "text/plain; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "pdf" => "application/pdf",
+        "wasm" => "application/wasm",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+fn static_open(root: fd::Fd, name: string) -> Result[fd::Fd, io::Error] {
+    let parts = name.split("/");
+    let mut directory = root.duplicate()?;
+    defer {
+        let _ = directory.close();
+    };
+    for index in 0..parts.len() {
+        let flags = fd::O_RDONLY | fd::O_NOFOLLOW | fd::O_NONBLOCK
+            | if index + 1 < parts.len() {
+                fd::O_DIRECTORY
+            } else {
+                0
+            };
+        let next = directory.open_at(parts[index], flags, 0)?;
+        let _ = directory.close();
+        directory = next;
+    }
+    directory.duplicate()
+}
+
+fn static_range(value: string, size: isize) -> Option[(isize, isize)] {
+    if !value.starts_with("bytes=") || value.contains(",") || size == 0 {
+        return Option::None
+    }
+    let (start, end) = value.byte_slice(6, value.byte_len()).split_once("-")?;
+    for text in Vec::from_array([start, end]) {
+        for byte in text.to_bytes() {
+            if byte < b'0' || byte > b'9' {
+                return Option::None
+            }
+        }
+    }
+    if start == "" {
+        let count = match num::parse_int_structured(end) {
+            Ok(value) => value,
+            Err(_) => return Option::None,
+        };
+        if count == 0 {
+            return Option::None
+        }
+        return Option::Some(
+            (
+                if count >= size {
+                    0
+                } else {
+                    size - count
+                },
+                size,
+            ),
+        )
+    }
+    let start = match num::parse_int_structured(start) {
+        Ok(value) => value,
+        Err(_) => return Option::None,
+    };
+    let end = if end == "" {
+        size - 1
+    } else {
+        match num::parse_int_structured(end) {
+            Ok(value) => if value >= size {
+                size - 1
+            } else {
+                value
+            },
+            Err(_) => return Option::None,
+        }
+    };
+    if start >= size || start > end {
+        Option::None
+    } else {
+        Option::Some((start, end + 1))
+    }
+}
+
+impl StaticFiles {
+    pub fn new(root: string, max_bytes: isize) -> Result[StaticFiles, Error] {
+        if max_bytes < 0 {
+            return Result::Err(Error::new(ErrorKind::Configuration, "negative static file limit"))
+        }
+        let root = fd::open(root, fd::O_RDONLY | fd::O_DIRECTORY | fd::O_NOFOLLOW, 0).map_err(
+            transport_error,
+        )?;
+        Result::Ok(StaticFiles { root, max_bytes })
+    }
+
+    pub fn close(self: StaticFiles) -> Result[(), Error] {
+        self.root.close().map_err(transport_error)
+    }
+
+    pub fn handler(self: StaticFiles, parameter: string) -> Handler {
+        |request: Request| self.serve(request, request.params().required(parameter)?)
+    }
+
+    pub fn serve(self: StaticFiles, request: Request, name: string) -> Result[Response, Error] {
+        request.check()?;
+        if request.method() != "GET" && request.method() != "HEAD" {
+            return Result::Ok(
+                Response::text(405, "method not allowed").header("allow", "GET, HEAD"),
+            )
+        }
+        if name == "" || name.contains("\\") || name.contains("\u0000") {
+            return Result::Ok(Response::text(404, "not found"))
+        }
+        for part in name.split("/") {
+            if part == "" || part == "." || part == ".." || part.starts_with(".") {
+                return Result::Ok(Response::text(404, "not found"))
+            }
+        }
+        let file = match static_open(self.root, name) {
+            Ok(value) => value,
+            Err(error) => if error.kind() == io::ErrorKind::NotFound
+                || error.kind() == io::ErrorKind::PermissionDenied
+                || error.raw_os_code() == Option::Some(40)
+                || error.raw_os_code() == Option::Some(20) {
+                return Result::Ok(Response::text(404, "not found"))
+            } else {
+                return Result::Err(transport_error(error))
+            },
+        };
+        defer {
+            let _ = file.close();
+        };
+        let metadata = file.stat().map_err(transport_error)?;
+        if metadata.mode.to_usize() & fd::S_IFMT != fd::S_IFREG {
+            return Result::Ok(Response::text(404, "not found"))
+        }
+        if metadata.size < 0 || metadata.size > self.max_bytes.to_i64() {
+            return Result::Err(Error::new(ErrorKind::BodyLimit, "static file exceeds limit"))
+        }
+        let output = Bytes::new();
+        let buffer: Vec[byte] = Vec::new();
+        for _ in 0..16384 {
+            buffer.push(0);
+        }
+        loop {
+            request.check()?;
+            let count = file.read(buffer.as_mut_slice()).map_err(transport_error)?;
+            if count == 0 {
+                break;
+            }
+            if count > self.max_bytes - output.len() {
+                return Result::Err(Error::new(ErrorKind::BodyLimit, "static file exceeds limit"))
+            }
+            output.extend_from_slice(buffer.slice(0, count));
+        }
+        let etag = "\"" + hash::sha256(output) + "\"";
+        let base = Response::new(200).header("content-type", static_media_type(name)).header(
+            "etag",
+            etag,
+        ).header("accept-ranges", "bytes").header("x-content-type-options", "nosniff");
+        for value in request.headers().get_all("if-none-match") {
+            for candidate in value.split(",") {
+                let candidate = candidate.trim();
+                if candidate == "*" || candidate == etag || candidate == "W/" + etag {
+                    return Result::Ok(Response { status_value: 304, ..base })
+                }
+            }
+        }
+        let ranges = request.headers().get_all("range");
+        if !ranges.is_empty() && request.headers().get("if-range").unwrap_or(etag) == etag {
+            let range = if ranges.len() == 1 {
+                static_range(ranges[0], output.len())
+            } else {
+                Option::None
+            };
+            if let Some((start, end)) = range {
+                let partial = Bytes::new();
+                partial.extend_from_slice(output.as_slice().sub(start, end));
+                return Result::Ok(
+                    Response { status_value: 206, ..base }.body(partial).header(
+                        "content-range",
+                        "bytes " + start.to_string() + "-" + (end - 1).to_string() + "/"
+                            + output.len().to_string(),
+                    ),
+                )
+            }
+            return Result::Ok(
+                Response { status_value: 416, ..base }.header(
+                    "content-range",
+                    "bytes */" + output.len().to_string(),
+                ),
+            )
+        }
+        Result::Ok(base.body(output))
+    }
+}

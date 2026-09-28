@@ -1,0 +1,158 @@
+package web;
+
+use ecosystem::compress;
+use ecosystem::compress::gzip;
+
+fn encoding_quality(value: string) -> Result[isize, Error] {
+    let invalid = Error::new(ErrorKind::BadRequest, "invalid Accept-Encoding quality");
+    if value == "0" {
+        return Result::Ok(0)
+    }
+    if value == "1" {
+        return Result::Ok(1000)
+    }
+    let parts = value.split(".");
+    if parts.len() != 2 || (parts[0] != "0" && parts[0] != "1") || parts[1].byte_len() > 3 {
+        return Result::Err(invalid)
+    }
+    let mut result = 0;
+    let mut scale = 100;
+    for byte in parts[1].to_bytes() {
+        if byte < b'0' || byte > b'9' || (parts[0] == "1" && byte != b'0') {
+            return Result::Err(invalid)
+        }
+        result += (byte - b'0').to_isize() * scale;
+        scale /= 10;
+    }
+    Result::Ok(
+        if parts[0] == "1" {
+            1000
+        } else {
+            result
+        },
+    )
+}
+
+fn accepted_encodings(headers: Headers) -> Result[(isize, isize), Error] {
+    let mut gzip = Option::None;
+    let mut identity = Option::None;
+    let mut wildcard = Option::None;
+    for value in headers.get_all("accept-encoding") {
+        for coding in value.split(",") {
+            if coding.trim() == "" {
+                continue;
+            }
+            let parts = coding.split(";");
+            let name = parts[0].trim().to_ascii_lowercase();
+            if !token(name) || parts.len() > 2 {
+                return Result::Err(bad_request("invalid Accept-Encoding"))
+            }
+            let quality = if parts.len() == 2 {
+                let (key, value) = parts[1].trim().split_once("=").ok_or(
+                    bad_request("invalid Accept-Encoding"),
+                )?;
+                if key.trim() != "q" {
+                    return Result::Err(bad_request("invalid Accept-Encoding parameter"))
+                }
+                encoding_quality(value.trim())?
+            } else {
+                1000
+            };
+            match name {
+                "gzip" => {
+                    gzip = Option::Some(quality);
+                },
+                "identity" => {
+                    identity = Option::Some(quality);
+                },
+                "*" => {
+                    wildcard = Option::Some(quality);
+                },
+                _ => (),
+            }
+        }
+    }
+    Result::Ok(
+        (
+            gzip.unwrap_or(wildcard.unwrap_or(0)),
+            identity.unwrap_or(
+                if wildcard == Option::Some(0) {
+                    0
+                } else {
+                    1000
+                },
+            ),
+        ),
+    )
+}
+
+fn no_transform(headers: Headers) -> bool {
+    for value in headers.get_all("cache-control") {
+        for directive in value.split(",") {
+            if directive.trim().eq_ignore_ascii_case("no-transform") {
+                return true
+            }
+        }
+    }
+    false
+}
+
+pub fn compression(max_bytes: isize) -> Result[Middleware, Error] {
+    if max_bytes < 0 || max_bytes > 67108864 {
+        return Result::Err(
+            Error::new(ErrorKind::Configuration, "compression limit must be in 0..67108864"),
+        )
+    }
+    Result::Ok(
+        |request: Request, next: Next| {
+            let (gzip_quality, identity_quality) = accepted_encodings(request.headers())?;
+            let response = next.run(request)?;
+            if response.status() < 200 {
+                return Result::Ok(response)
+            }
+            if response.headers().get("content-encoding").is_some() {
+                return Result::Ok(response)
+            }
+            let response = vary_header(response, "Accept-Encoding");
+            let eligible = response.status() != 204 && response.status() != 304
+                && response.status() != 206
+                && response.stream_value.is_none()
+                && response.bytes_value.len() <= max_bytes
+                && !no_transform(response.headers())
+                && !no_transform(request.headers())
+                && response.headers().get("content-range").is_none();
+            if !eligible || gzip_quality == 0 || gzip_quality < identity_quality {
+                return Result::Ok(
+                    if identity_quality == 0 && response.status() != 204 && response.status() != 304 {
+                        vary_header(
+                            Response::text(406, "no acceptable content encoding"),
+                            "Accept-Encoding",
+                        )
+                    } else {
+                        response
+                    },
+                )
+            }
+            let limits = compress::Limits {
+                max_input_bytes: max_bytes,
+                max_output_bytes: max_bytes + max_bytes / 100 + 1024,
+                max_blocks: max_bytes / 32768 + 16,
+                max_work: max_bytes * 1024 + 65536,
+            };
+            let encoded = gzip::encode(response.bytes_value, limits, 1).map_err(
+                |error| Error::new(ErrorKind::Internal, error.to_string()),
+            )?;
+            let mut response = response.body(encoded).header("content-encoding", "gzip");
+            response = Response {
+                headers_value: response.headers().remove("content-md5").remove("digest"),
+                ..response,
+            };
+            if let Some(etag) = response.headers().get("etag") {
+                if !etag.starts_with("W/") {
+                    response = response.header("etag", "W/" + etag);
+                }
+            }
+            Result::Ok(response)
+        },
+    )
+}

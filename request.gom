@@ -157,6 +157,7 @@ impl Body {
 }
 
 pub struct Request {
+    http11_value: bool,
     lifetime: Lifetime,
     body_value: Body,
     remote_value: string,

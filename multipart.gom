@@ -1,0 +1,187 @@
+package web;
+
+use ecosystem::mime;
+use ecosystem::mime::multipart;
+use std::bytes::{Bytes};
+
+pub struct Multipart {
+    reader: multipart::Reader[Body],
+    lifetime: Lifetime,
+    gate: Channel[()],
+    generation: Ref[isize],
+    active: Ref[bool],
+}
+
+pub struct MultipartField {
+    parent: Multipart,
+    generation: isize,
+    pub name: string,
+    pub filename: Option[string],
+    pub content_type: Option[string],
+    pub headers: Headers,
+}
+
+fn multipart_error(error: multipart::Error) -> Error {
+    if let Some(cause) = error.cause {
+        return transport_error(cause)
+    }
+    Error::new(
+        if error.kind == multipart::ErrorKind::Limit {
+            ErrorKind::BodyLimit
+        } else {
+            ErrorKind::BadRequest
+        },
+        error.to_string(),
+    )
+}
+
+impl Request {
+    pub fn multipart(self: Request, limits: multipart::Limits) -> Result[Multipart, Error] {
+        self.check()?;
+        let types = self.headers().get_all("content-type");
+        if types.len() != 1 {
+            return Result::Err(
+                Error::new(ErrorKind::UnsupportedMediaType, "expected multipart/form-data"),
+            )
+        }
+        let media = mime::parse_media_type(types[0], mime::Limits::standard()).map_err(
+            |error| bad_request(error.to_string()),
+        )?;
+        if media.essence != "multipart/form-data" {
+            return Result::Err(
+                Error::new(ErrorKind::UnsupportedMediaType, "expected multipart/form-data"),
+            )
+        }
+        let boundary = media.parameter("boundary").ok_or(
+            bad_request("multipart boundary is missing"),
+        )?;
+        let reader = multipart::Reader::new(self.body(), boundary, limits).map_err(multipart_error)?;
+        let gate = Channel::new(1);
+        gate.send(());
+        Result::Ok(
+            Multipart {
+                reader,
+                lifetime: self.lifetime,
+                gate,
+                generation: Ref::new(0),
+                active: Ref::new(false),
+            },
+        )
+    }
+}
+
+impl Multipart {
+    pub fn next_field(self: Multipart) -> Result[Option[MultipartField], Error] {
+        self.lifetime.acquire(self.gate)?;
+        defer self.gate.send(());
+        self.lifetime.check()?;
+        if self.active.get() {
+            let buffer: Vec[byte] = Vec::new();
+            for _ in 0..16384 {
+                buffer.push(0);
+            }
+            while self.reader.read_body_chunk(buffer.as_mut_slice()).map_err(multipart_error)? != 0 {
+                self.lifetime.check()?;
+            }
+        }
+        self.active.set(false);
+        self.generation.set(self.generation.get() + 1);
+        let Some(raw) = self.reader.next_part().map_err(multipart_error)? else {
+            return Result::Ok(Option::None)
+        };
+        self.active.set(true);
+        let mut headers = Headers::new();
+        for field in raw.fields() {
+            headers = headers.append(
+                field.name,
+                field.value_text().map_err(|error| bad_request(error.to_string()))?,
+            )?;
+        }
+        let dispositions = headers.get_all("content-disposition");
+        if dispositions.len() != 1 {
+            return Result::Err(bad_request("multipart field requires one Content-Disposition"))
+        }
+        let disposition = mime::parse_media_type(
+            "multipart/" + dispositions[0],
+            mime::Limits::standard(),
+        ).map_err(|error| bad_request(error.to_string()))?;
+        if disposition.essence != "multipart/form-data" {
+            return Result::Err(bad_request("expected form-data disposition"))
+        }
+        let name = disposition.parameter("name").ok_or(
+            bad_request("multipart field name is missing"),
+        )?;
+        if headers.get_all("content-type").len() > 1
+            || headers.get("content-transfer-encoding").is_some() {
+            return Result::Err(bad_request("unsupported multipart content headers"))
+        }
+        Result::Ok(
+            Option::Some(
+                MultipartField {
+                    parent: self,
+                    generation: self.generation.get(),
+                    name,
+                    filename: disposition.parameter("filename"),
+                    content_type: headers.get("content-type"),
+                    headers,
+                },
+            ),
+        )
+    }
+}
+
+impl MultipartField {
+    pub fn read(self: MultipartField, maximum: isize) -> Result[Bytes, Error] {
+        if maximum <= 0 || maximum > 65536 {
+            return Result::Err(
+                Error::new(ErrorKind::Configuration, "multipart read size must be in 1..65536"),
+            )
+        }
+        self.parent.lifetime.acquire(self.parent.gate)?;
+        defer self.parent.gate.send(());
+        self.parent.lifetime.check()?;
+        if self.generation != self.parent.generation.get() {
+            return Result::Err(closed_error())
+        }
+        let buffer: Vec[byte] = Vec::new();
+        for _ in 0..maximum {
+            buffer.push(0);
+        }
+        let count = self.parent.reader.read_body_chunk(buffer.as_mut_slice()).map_err(
+            multipart_error,
+        )?;
+        if count == 0 {
+            self.parent.active.set(false);
+        }
+        buffer.truncate(count);
+        Result::Ok(Bytes::from_vec(buffer))
+    }
+
+    pub fn collect(self: MultipartField, limit: isize) -> Result[Bytes, Error] {
+        if limit < 0 {
+            return Result::Err(
+                Error::new(ErrorKind::Configuration, "negative multipart field limit"),
+            )
+        }
+        let result = Bytes::new();
+        loop {
+            let remaining = limit - result.len();
+            let data = self.read(
+                if remaining >= 16384 {
+                    16384
+                } else {
+                    remaining + 1
+                },
+            )?;
+            if data.is_empty() {
+                return Result::Ok(result)
+            }
+            if data.len() > remaining {
+                return Result::Err(
+                    Error::new(ErrorKind::BodyLimit, "multipart field exceeds collection limit"),
+                )
+            }
+            result.extend_from_slice(data.as_slice());
+        }
+    }
+}

@@ -67,6 +67,7 @@ impl Event {
 }
 
 pub struct Response {
+    upgrade_value: Option[WebSocketUpgrade],
     status_value: isize,
     headers_value: Headers,
     bytes_value: Bytes,
@@ -77,6 +78,7 @@ pub struct Response {
 impl Response {
     pub fn new(status: isize) -> Response {
         Response {
+            upgrade_value: Option::None,
             status_value: status,
             headers_value: Headers::new(),
             bytes_value: Bytes::new(),
@@ -187,6 +189,29 @@ impl Response {
     pub fn validate(self: Response) -> Result[(), Error] {
         if let Some(error) = self.error {
             return Result::Err(error)
+        }
+        if self.upgrade_value.is_some() {
+            for name in Vec::from_array(
+                ["sec-websocket-accept", "sec-websocket-protocol", "sec-websocket-extensions"],
+            ) {
+                if self.headers_value.get(name).is_some() {
+                    return Result::Err(
+                        Error::new(
+                            ErrorKind::Configuration,
+                            "WebSocket transport manages negotiation headers",
+                        ),
+                    )
+                }
+            }
+        }
+        if self.upgrade_value.is_some()
+            && (!self.bytes_value.is_empty() || self.stream_value.is_some()) {
+            return Result::Err(
+                Error::new(
+                    ErrorKind::Configuration,
+                    "WebSocket upgrade cannot have a response body",
+                ),
+            )
         }
         if (self.status_value == 204 || self.status_value == 304)
             && (!self.bytes_value.is_empty() || self.stream_value.is_some()) {

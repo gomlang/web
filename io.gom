@@ -9,6 +9,7 @@ fn io_error(error: Error, operation: string) -> io::Error {
         ErrorKind::BadRequest => io::ErrorKind::InvalidData,
         ErrorKind::BodyLimit => io::ErrorKind::InvalidData,
         ErrorKind::Timeout => io::ErrorKind::TimedOut,
+        ErrorKind::Cancelled => io::ErrorKind::Interrupted,
         ErrorKind::Closed => io::ErrorKind::BrokenPipe,
         _ => io::ErrorKind::Other,
     };

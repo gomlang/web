@@ -1,0 +1,127 @@
+package web;
+
+use ecosystem::websocket;
+use std::bytes::{Bytes};
+use std::context;
+use std::panic;
+
+struct WebSocketUpgrade {
+    response: Bytes,
+    limits: websocket::Limits,
+    handler: (websocket::Connection, context::Context) -> Result[(), Error],
+}
+
+fn websocket_error(error: websocket::Error) -> Error {
+    Error::new(
+        match error.kind {
+            Handshake | InvalidInput => ErrorKind::BadRequest,
+            Timeout => ErrorKind::Timeout,
+            Cancelled => ErrorKind::Cancelled,
+            Closed => ErrorKind::Closed,
+            _ => ErrorKind::Transport,
+        },
+        error.message,
+    )
+}
+
+impl Request {
+    pub fn websocket(self: Request, limit: isize) -> Result[websocket::ServerRequest, Error] {
+        if !self.http11_value {
+            return Result::Err(bad_request("WebSocket upgrades require HTTP/1.1"))
+        }
+        let target = self.path_value
+            + if self.query_value == "" {
+                ""
+            } else {
+                "?" + self.query_value
+            };
+        let mut head = self.method_value + " " + target + " HTTP/1.1\r\nhost: " + self.host_value
+            + "\r\n";
+        for (name, value) in self.headers_value.entries() {
+            head = head + name + ": " + value + "\r\n";
+        }
+        websocket::ServerRequest::parse(Bytes::from_string(head + "\r\n"), limit).map_err(
+            websocket_error,
+        )
+    }
+}
+
+impl Response {
+    pub fn websocket(
+        request: Request,
+        selected_protocol: Option[string],
+        limits: websocket::Limits,
+        handler: (websocket::Connection, context::Context) -> Result[(), Error],
+    ) -> Result[Response, Error] {
+        limits.validate().map_err(websocket_error)?;
+        let handshake = request.websocket(limits.handshake_bytes)?;
+        let response = handshake.response(selected_protocol).map_err(websocket_error)?;
+        if response.len() > limits.handshake_bytes {
+            return Result::Err(bad_request("WebSocket response handshake exceeds limit"))
+        }
+        Result::Ok(
+            Response {
+                status_value: 101,
+                error: Option::None,
+                upgrade_value: Option::Some(WebSocketUpgrade { response, limits, handler }),
+                ..Response::new(200),
+            },
+        )
+    }
+}
+
+fn serve_websocket(
+    upgrade: WebSocketUpgrade,
+    headers: Headers,
+    stream: ConnectionStream,
+    input: Input,
+    context: context::Context,
+) -> Result[(), Error] {
+    let head = Bytes::from_slice_copy(upgrade.response.slice(0, upgrade.response.len() - 2));
+    for (name, value) in headers.entries() {
+        if name == "sec-websocket-accept" || name == "sec-websocket-protocol"
+            || name == "sec-websocket-extensions" {
+            return Result::Err(
+                Error::new(
+                    ErrorKind::Configuration,
+                    "WebSocket transport manages negotiation headers",
+                ),
+            )
+        }
+        head.extend_from_slice(Bytes::from_string(name + ": " + value + "\r\n").as_slice());
+    }
+    head.extend_from_slice(Bytes::from_string("\r\n").as_slice());
+    if head.len() > upgrade.limits.handshake_bytes {
+        return Result::Err(
+            Error::new(ErrorKind::Configuration, "WebSocket response headers exceed limit"),
+        )
+    }
+    socket_write(stream, context, head)?;
+    let transport = websocket::Transport::new(
+        |buffer, call_context| {
+            if buffer.len() == 0 {
+                return Result::Ok(0)
+            }
+            let data = input.take_with(buffer.len(), call_context).map_err(
+                |error| io_error(error, "read WebSocket"),
+            )?;
+            for index in 0..data.len() {
+                buffer[index] = data.as_slice()[index];
+            }
+            Result::Ok(data.len())
+        },
+        |buffer, call_context| stream.write_with(buffer, call_context),
+        || stream.close(),
+    );
+    let connection = websocket::Connection::upgraded(
+        transport,
+        websocket::Role::Server,
+        upgrade.limits,
+        Bytes::new(),
+    ).map_err(websocket_error)?;
+    defer {
+        let _ = connection.abort();
+    };
+    panic::catch(|| (upgrade.handler)(connection, context)).map_err(|_| callback_panic())??;
+    Result::Ok(())
+}
