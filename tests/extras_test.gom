@@ -1,0 +1,250 @@
+package tests;
+
+use ecosystem::web;
+use ecosystem::compress;
+use ecosystem::compress::gzip;
+use ecosystem::mime::multipart;
+use std::bytes::{Bytes};
+use std::fs;
+use std::os::linux::fd;
+use std::testing;
+
+fn extras_dispatch(
+    router: web::Router,
+    method: string,
+    path: string,
+    headers: web::Headers,
+    body: Bytes,
+) -> web::CapturedResponse {
+    testing::expect_ok(router.dispatch(method, path, headers, body), "dispatch extras")
+}
+
+fn extras_header(headers: web::Headers, name: string, value: string) -> web::Headers {
+    testing::expect_ok(headers.append(name, value), "header")
+}
+
+#[test]
+fn cors_preflight_credentials_and_cache_variation() -> () {
+    let policy = web::Cors::new(Vec::from_array(["https://client.example"])).allow_credentials(true).allow_methods(
+        Vec::from_array(["GET", "PUT"]),
+    ).allow_headers(Vec::from_array(["content-type", "x-token"])).expose_headers(
+        Vec::from_array(["x-result"]),
+    );
+    let router = web::Router::new().get("/", |_| Result::Ok(web::Response::text(200, "ok"))).layer(
+        testing::expect_ok(policy.layer(), "CORS"),
+    );
+    let headers = extras_header(
+        extras_header(
+            extras_header(web::Headers::new(), "origin", "https://client.example"),
+            "access-control-request-method",
+            "PUT",
+        ),
+        "access-control-request-headers",
+        "Content-Type, X-Token",
+    );
+    let preflight = extras_dispatch(router, "OPTIONS", "/", headers, Bytes::new());
+    testing::assert_eq(preflight.status, 204);
+    testing::assert_eq(
+        preflight.headers.get("access-control-allow-origin").unwrap_or(""),
+        "https://client.example",
+    );
+    testing::assert_eq(
+        preflight.headers.get("access-control-allow-credentials").unwrap_or(""),
+        "true",
+    );
+    testing::assert(preflight.headers.get_all("vary").contains("Access-Control-Request-Headers"));
+    let denied = extras_dispatch(
+        router,
+        "OPTIONS",
+        "/",
+        extras_header(
+            headers.remove("access-control-request-headers"),
+            "access-control-request-headers",
+            "authorization",
+        ),
+        Bytes::new(),
+    );
+    testing::assert_eq(denied.status, 403);
+    let actual = extras_dispatch(
+        router,
+        "GET",
+        "/",
+        extras_header(web::Headers::new(), "origin", "https://client.example"),
+        Bytes::new(),
+    );
+    testing::assert_eq(actual.status, 200);
+    testing::assert_eq(
+        actual.headers.get("access-control-expose-headers").unwrap_or(""),
+        "x-result",
+    );
+    let absent = extras_dispatch(router, "GET", "/", web::Headers::new(), Bytes::new());
+    testing::assert(absent.headers.get_all("vary").contains("Origin"));
+    testing::assert(web::Cors::new(Vec::from_array(["*"])).allow_credentials(true).layer().is_err());
+}
+
+#[test]
+fn compression_negotiates_quality_preserves_ranges_and_roundtrips_gzip() -> () {
+    let body = "a compressible response".repeat(100);
+    let router = web::Router::new().get(
+        "/",
+        |_| Result::Ok(web::Response::text(200, body).header("etag", "\"original\"")),
+    ).get(
+        "/plain",
+        |_| Result::Ok(web::Response::text(200, body).header("cache-control", "no-transform")),
+    ).layer(testing::expect_ok(web::compression(65536), "compression"));
+    let headers = extras_header(web::Headers::new(), "accept-encoding", "gzip");
+    let encoded = extras_dispatch(router, "GET", "/", headers, Bytes::new());
+    testing::assert_eq(encoded.headers.get("content-encoding").unwrap_or(""), "gzip");
+    testing::assert_eq(encoded.headers.get("etag").unwrap_or(""), "W/\"original\"");
+    let decoded = testing::expect_ok(
+        gzip::decode(
+            encoded.bytes(),
+            compress::Limits {
+                max_input_bytes: 65536,
+                max_output_bytes: 65536,
+                max_blocks: 100,
+                max_work: 10000000,
+            },
+        ),
+        "decode gzip",
+    );
+    testing::assert(decoded.to_vec_copy() == Bytes::from_string(body).to_vec_copy());
+    let plain = extras_dispatch(
+        router,
+        "GET",
+        "/",
+        extras_header(web::Headers::new(), "accept-encoding", "gzip;q=0.1, identity;q=1"),
+        Bytes::new(),
+    );
+    testing::assert(plain.headers.get("content-encoding").is_none());
+    testing::assert(plain.headers.get_all("vary").contains("Accept-Encoding"));
+    let unacceptable = extras_dispatch(
+        router,
+        "GET",
+        "/",
+        extras_header(web::Headers::new(), "accept-encoding", "*;q=0"),
+        Bytes::new(),
+    );
+    testing::assert_eq(unacceptable.status, 406);
+    let untouched = extras_dispatch(router, "GET", "/plain", headers, Bytes::new());
+    testing::assert(untouched.headers.get("content-encoding").is_none());
+    let head = extras_dispatch(router, "HEAD", "/", headers, Bytes::new());
+    testing::assert(head.bytes().is_empty());
+}
+
+#[test]
+fn multipart_fields_stream_drain_and_invalidate_previous_handles() -> () {
+    let router = web::Router::new().post(
+        "/",
+        |request| {
+            let fields = request.multipart(multipart::Limits::standard())?;
+            let first = fields.next_field()?.ok_or(
+                web::Error::new(web::ErrorKind::BadRequest, "missing first"),
+            )?;
+            testing::assert_eq(first.name, "text");
+            testing::assert_eq(first.read(1)?.len(), 1);
+            let second = fields.next_field()?.ok_or(
+                web::Error::new(web::ErrorKind::BadRequest, "missing second"),
+            )?;
+            testing::assert(first.read(1).is_err());
+            testing::assert_eq(second.filename.unwrap_or(""), "data.bin");
+            testing::assert(
+                second.collect(8)?.to_vec_copy()
+                    == Vec::from_array([0.to_u8(), 255.to_u8(), 42.to_u8()]),
+            );
+            testing::assert(fields.next_field()?.is_none());
+            Result::Ok(web::Response::text(200, "uploaded"))
+        },
+    );
+    let body = Bytes::from_string(
+        "--boundary\r\nContent-Disposition: form-data; name=\"text\"\r\n\r\nhello\r\n--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"data.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n",
+    );
+    body.extend_from_slice(Vec::from_array([0.to_u8(), 255.to_u8(), 42.to_u8()]).as_slice());
+    body.extend_from_slice(Bytes::from_string("\r\n--boundary--\r\n").as_slice());
+    let response = extras_dispatch(
+        router,
+        "POST",
+        "/",
+        extras_header(web::Headers::new(), "content-type", "multipart/form-data; boundary=boundary"),
+        body,
+    );
+    testing::assert_eq(response.status, 200);
+    let limited = web::Router::new().post(
+        "/",
+        |request| {
+            let fields = request.multipart(
+                multipart::Limits { max_part_bytes: 2, ..multipart::Limits::standard() },
+            )?;
+            let field = fields.next_field()?.ok_or(
+                web::Error::new(web::ErrorKind::BadRequest, "missing field"),
+            )?;
+            let _ = field.collect(10)?;
+            Result::Ok(web::Response::new(200))
+        },
+    );
+    let response = extras_dispatch(
+        limited,
+        "POST",
+        "/",
+        extras_header(web::Headers::new(), "content-type", "multipart/form-data; boundary=b"),
+        Bytes::from_string("--b\r\nContent-Disposition: form-data; name=x\r\n\r\nlong\r\n--b--\r\n"),
+    );
+    testing::assert_eq(response.status, 413);
+}
+
+#[test]
+fn static_files_support_ranges_etags_and_reject_traversal_and_symlinks() -> () {
+    let root = "_artifact/static-files-regression";
+    let _ = fs::remove_dir_all(root);
+    testing::expect_ok(fs::create_dir_all(root + "/public"), "directory");
+    testing::expect_ok(fs::write_file_structured(root + "/public/file.txt", "0123456789"), "file");
+    testing::expect_ok(fs::write_file_structured(root + "/secret.txt", "secret"), "secret");
+    testing::expect_ok(
+        fd::symlink_at("../secret.txt", fd::AT_FDCWD, root + "/public/link.txt"),
+        "symlink",
+    );
+    let files = testing::expect_ok(web::StaticFiles::new(root + "/public", 100), "static root");
+    defer {
+        let _ = files.close();
+    };
+    let router = web::Router::new().get("/{*path}", files.handler("path"));
+    let ordinary = extras_dispatch(router, "GET", "/file.txt", web::Headers::new(), Bytes::new());
+    testing::assert_eq(ordinary.status, 200);
+    testing::assert_eq(testing::expect_ok(ordinary.text(), "text"), "0123456789");
+    let etag = ordinary.headers.get("etag").unwrap_or("");
+    let cached = extras_dispatch(
+        router,
+        "GET",
+        "/file.txt",
+        extras_header(web::Headers::new(), "if-none-match", etag),
+        Bytes::new(),
+    );
+    testing::assert_eq(cached.status, 304);
+    testing::assert(cached.bytes().is_empty());
+    let partial = extras_dispatch(
+        router,
+        "GET",
+        "/file.txt",
+        extras_header(web::Headers::new(), "range", "bytes=2-4"),
+        Bytes::new(),
+    );
+    testing::assert_eq(partial.status, 206);
+    testing::assert_eq(testing::expect_ok(partial.text(), "partial"), "234");
+    for path in Vec::from_array(["/../secret.txt", "/%2e%2e/secret.txt", "/link.txt", "/.hidden"]) {
+        testing::assert_eq(
+            extras_dispatch(router, "GET", path, web::Headers::new(), Bytes::new()).status,
+            404,
+        );
+    }
+    let range = extras_dispatch(
+        router,
+        "GET",
+        "/file.txt",
+        extras_header(web::Headers::new(), "range", "bytes=99-"),
+        Bytes::new(),
+    );
+    testing::assert_eq(range.status, 416);
+    testing::assert(
+        extras_dispatch(router, "HEAD", "/file.txt", web::Headers::new(), Bytes::new()).bytes().is_empty(),
+    );
+}

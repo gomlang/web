@@ -1,0 +1,270 @@
+package tests;
+
+use ecosystem::web;
+use ecosystem::websocket as ws;
+use ecosystem::request;
+use std::bytes::{Bytes};
+use std::context;
+use std::ffi;
+use std::net::tls;
+use std::net::{SocketAddr};
+use std::testing;
+use std::time::{Duration, Timer};
+
+#[go_ffi("example.com/goml-ecosystem/web/testcert", "Generate")]
+extern fn test_certificate() -> (ffi::RawSlice[byte], ffi::RawSlice[byte], ffi::Error);
+
+fn upgrade_router() -> web::Router {
+    web::Router::new().get(
+        "/ws",
+        |request| {
+            web::Response::websocket(
+                request,
+                Option::Some("echo"),
+                ws::Limits::standard(),
+                |connection, context| {
+                    let message = connection.receive(context).map_err(
+                        |error| web::Error::new(web::ErrorKind::Transport, error.message),
+                    )?;
+                    connection.send(message, context).map_err(
+                        |error| web::Error::new(web::ErrorKind::Transport, error.message),
+                    )
+                },
+            )
+        },
+    )
+}
+
+#[test]
+fn websocket_upgrade_preserves_frames_coalesced_with_http_headers() -> () {
+    let server = transport_server(upgrade_router());
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    let stream = transport_connect(server);
+    defer {
+        let _ = stream.close();
+    };
+    let request = testing::expect_ok(
+        ws::ClientRequest::new("localhost", "/ws", Vec::from_array(["echo"])),
+        "upgrade request",
+    );
+    let wire = request.encode();
+    let frame = testing::expect_ok(
+        ws::encode_frame(
+            ws::Frame {
+                final: true,
+                opcode: ws::Opcode::Text,
+                payload: Bytes::from_string("early frame"),
+            },
+            Option::Some(Bytes::from_vec(Vec::from_array([1, 2, 3, 4]))),
+        ),
+        "masked frame",
+    );
+    wire.extend_from_slice(frame.as_slice());
+    testing::assert_ok(stream.write_all_with(wire.as_slice(), transport_wait()));
+    let head = transport_head(stream);
+    testing::assert(
+        testing::expect_ok(
+            request.validate_response(Bytes::from_string(head), 16384),
+            "upgrade response",
+        )
+            == Option::Some("echo"),
+    );
+    let connection = testing::expect_ok(
+        ws::Connection::upgraded(
+            ws::Transport::tcp(stream),
+            ws::Role::Client,
+            ws::Limits::standard(),
+            Bytes::new(),
+        ),
+        "upgraded connection",
+    );
+    context::with_timeout(
+        context::Context::background(),
+        Duration::from_seconds(2),
+        |context, _| {
+            match testing::expect_ok(connection.receive(context), "echo frame") {
+                Text(value) => testing::assert_eq(value, "early frame"),
+                _ => testing::fail("expected text frame"),
+            }
+        },
+    );
+}
+
+#[test]
+fn websocket_invalid_handshake_is_http_error_and_dispatch_rejects_upgrade() -> () {
+    let server = transport_server(upgrade_router());
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    let response = transport_request(
+        server,
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(response.starts_with("HTTP/1.1 400"));
+    let headers = testing::expect_ok(
+        web::Headers::new().append("upgrade", "websocket"),
+        "upgrade header",
+    );
+    let headers = testing::expect_ok(headers.append("connection", "upgrade"), "connection header");
+    let headers = testing::expect_ok(
+        headers.append("sec-websocket-version", "13"),
+        "version header",
+    );
+    let headers = testing::expect_ok(
+        headers.append("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        "key header",
+    );
+    let headers = testing::expect_ok(
+        headers.append("sec-websocket-protocol", "echo"),
+        "protocol header",
+    );
+    testing::assert(upgrade_router().dispatch("GET", "/ws", headers, Bytes::new()).is_err());
+}
+
+#[test]
+fn tls_listener_verifies_certificate_serves_http_and_upgrades_websocket() -> () {
+    let (certificate, key, error) = test_certificate();
+    testing::assert(ffi::error_is_nil(error));
+    let certificate = Bytes::from_vec(ffi::slice_to_vec_copy(certificate));
+    let key = Bytes::from_vec(ffi::slice_to_vec_copy(key));
+    let router = upgrade_router().get("/", |_| Result::Ok(web::Response::text(200, "secure")));
+    let server = testing::expect_ok(
+        router.serve_tls(
+            "127.0.0.1:0",
+            web::TlsConfig::new(certificate, key).with_minimum_version(tls::Version::Tls13),
+        ),
+        "TLS server",
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    let address = testing::expect_ok(server.address(), "TLS address");
+    testing::assert(request::get("https://" + address + "/").is_err());
+    let (_, certificate_text) = string_from_utf8(certificate.to_vec_copy());
+    let client = testing::expect_ok(
+        request::Client::builder().add_root_certificate(certificate_text).build(),
+        "trusted client",
+    );
+    let response = testing::expect_ok(
+        client.get("https://" + address + "/").send(),
+        "HTTPS request",
+    );
+    testing::assert_eq(testing::expect_ok(response.text(), "HTTPS body"), "secure");
+    let port = testing::expect_ok(SocketAddr::parse(address), "TLS address").port;
+    let stream = testing::expect_ok(
+        tls::connect(
+            "127.0.0.1",
+            port,
+            tls::ClientConfig::new("localhost").with_ca_pem(certificate.as_slice()),
+        ),
+        "TLS websocket connection",
+    );
+    context::with_timeout(
+        context::Context::background(),
+        Duration::from_seconds(2),
+        |context, _| {
+            let request = testing::expect_ok(
+                ws::ClientRequest::new(address, "/ws", Vec::from_array(["echo"])),
+                "secure upgrade request",
+            );
+            let (connection, protocol) = testing::expect_ok(
+                ws::client(ws::Transport::tls(stream), request, ws::Limits::standard(), context),
+                "secure upgrade",
+            );
+            testing::assert(protocol == Option::Some("echo"));
+            testing::assert_ok(connection.send(ws::Message::Text("encrypted"), context));
+            match testing::expect_ok(connection.receive(context), "secure echo") {
+                Text(value) => testing::assert_eq(value, "encrypted"),
+                _ => testing::fail("expected secure text frame"),
+            }
+            let _ = connection.abort();
+        },
+    );
+}
+
+fn upgrade_receive[T](channel: Channel[T]) -> T {
+    let timer = Timer::new(Duration::from_seconds(2));
+    defer {
+        let _ = timer.stop();
+    };
+    let value = select {
+        recv(channel) as value => value,
+        recv(timer.done()) as _ => Option::None,
+    };
+    testing::expect_some(value, "upgrade event within deadline")
+}
+
+#[test]
+fn tls_websocket_cancellation_interrupts_a_blocked_write() -> () {
+    let (certificate, key, error) = test_certificate();
+    testing::assert(ffi::error_is_nil(error));
+    let certificate = Bytes::from_vec(ffi::slice_to_vec_copy(certificate));
+    let cancellation: Channel[context::CancelHandle] = Channel::new(1);
+    let completed = Channel::new(1);
+    let payload = Bytes::from_string("x".repeat(65536));
+    let router = web::Router::new().get(
+        "/ws",
+        |request| {
+            web::Response::websocket(
+                request,
+                Option::None,
+                ws::Limits::standard(),
+                |connection, parent| {
+                    context::with_cancel(
+                        parent,
+                        |context, cancel| {
+                            cancellation.send(cancel);
+                            for _ in 0..4096 {
+                                if let Err(error) = connection.send(
+                                    ws::Message::Binary(payload),
+                                    context,
+                                ) {
+                                    completed.send(error.kind == ws::ErrorKind::Cancelled);
+                                    return Result::Ok(())
+                                }
+                            }
+                            completed.send(false);
+                            Result::Ok(())
+                        },
+                    )
+                },
+            )
+        },
+    );
+    let server = testing::expect_ok(
+        router.serve_tls(
+            "127.0.0.1:0",
+            web::TlsConfig::new(certificate, Bytes::from_vec(ffi::slice_to_vec_copy(key))),
+        ),
+        "TLS cancellation server",
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    let address = testing::expect_ok(server.address(), "TLS address");
+    let port = testing::expect_ok(SocketAddr::parse(address), "TLS address").port;
+    let stream = testing::expect_ok(
+        tls::connect(
+            "127.0.0.1",
+            port,
+            tls::ClientConfig::new("localhost").with_ca_pem(certificate.as_slice()),
+        ),
+        "TLS connection",
+    );
+    defer {
+        let _ = stream.close();
+    };
+    let request = testing::expect_ok(
+        ws::ClientRequest::new(address, "/ws", Vec::new()),
+        "upgrade request",
+    );
+    testing::assert_ok(
+        stream.write_all_with(request.encode().as_slice(), context::Context::background()),
+    );
+    let cancel = upgrade_receive(cancellation);
+    testing::assert_ok(context::Context::background().sleep(Duration::from_milliseconds(100)));
+    cancel.cancel();
+    testing::assert(upgrade_receive(completed));
+}

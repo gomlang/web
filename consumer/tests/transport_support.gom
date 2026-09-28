@@ -1,0 +1,93 @@
+package tests;
+
+use ecosystem::web;
+use web::{Router, Server};
+use std::net::{TcpStream, SocketAddr, WaitOptions};
+use std::testing;
+use std::time::{Duration};
+
+fn transport_wait() -> WaitOptions {
+    WaitOptions::new().with_timeout(Duration::from_seconds(2))
+}
+
+fn transport_server(router: Router) -> Server {
+    testing::expect_ok(router.serve("127.0.0.1:0"), "serve TCP")
+}
+
+fn transport_connect(server: Server) -> TcpStream {
+    let address = testing::expect_ok(server.address(), "server address");
+    testing::expect_ok(
+        TcpStream::connect_with(
+            testing::expect_ok(SocketAddr::parse(address), "socket address"),
+            transport_wait(),
+        ),
+        "TCP connect",
+    )
+}
+
+fn transport_send(stream: TcpStream, data: string) -> () {
+    testing::assert_ok(stream.write_all_with(data.to_bytes().as_slice(), transport_wait()));
+}
+
+fn transport_exact(stream: TcpStream, length: isize) -> string {
+    let data = Vec::new();
+    for _ in 0..length {
+        data.push(0);
+    }
+    testing::assert_ok(stream.read_exact_with(data.as_mut_slice(), transport_wait()));
+    let (valid, result) = string_from_utf8(data);
+    testing::assert(valid);
+    result
+}
+
+fn transport_line(stream: TcpStream) -> string {
+    let mut result = "";
+    loop {
+        result += transport_exact(stream, 1);
+        testing::assert(result.byte_len() < 8192);
+        if result.ends_with("\r\n") {
+            return result
+        }
+    }
+}
+
+fn transport_head(stream: TcpStream) -> string {
+    let mut result = "";
+    loop {
+        let line = transport_line(stream);
+        result += line;
+        if line == "\r\n" {
+            return result
+        }
+    }
+}
+
+fn transport_closed(stream: TcpStream) -> string {
+    let data = Vec::new();
+    let buffer = Vec::new();
+    for _ in 0..4096 {
+        buffer.push(0);
+    }
+    loop {
+        let count = testing::expect_ok(
+            stream.read_with(buffer.as_mut_slice(), transport_wait()),
+            "read response until close",
+        );
+        if count == 0 {
+            let (valid, result) = string_from_utf8(data);
+            testing::assert(valid);
+            return result
+        }
+        data.extend(buffer.slice(0, count).to_vec());
+        testing::assert(data.len() <= 1048576);
+    }
+}
+
+fn transport_request(server: Server, request: string) -> string {
+    let stream = transport_connect(server);
+    defer {
+        let _ = stream.close();
+    };
+    transport_send(stream, request);
+    transport_closed(stream)
+}

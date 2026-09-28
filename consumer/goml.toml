@@ -2,5 +2,6 @@
 path = "consumer::web"
 
 [dependencies]
+"ecosystem::websocket" = "0.1.0"
 "ecosystem::request" = "0.1.0"
 "ecosystem::web" = "0.1.0"

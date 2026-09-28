@@ -1,0 +1,35 @@
+package tests;
+
+use ecosystem::web;
+use std::bytes::{Bytes};
+use std::testing;
+
+#[test]
+fn consumer_can_compose_public_cors_and_compression_middleware() -> () {
+    let cors = testing::expect_ok(
+        web::Cors::new(Vec::from_array(["https://consumer.example"])).layer(),
+        "CORS middleware",
+    );
+    let compression = testing::expect_ok(web::compression(65536), "compression middleware");
+    let router = web::Router::new().get(
+        "/",
+        |_| Result::Ok(web::Response::text(200, "public response".repeat(100))),
+    ).layer(cors).layer(compression);
+    let headers = testing::expect_ok(
+        web::Headers::new().append("origin", "https://consumer.example"),
+        "origin",
+    );
+    let headers = testing::expect_ok(headers.append("accept-encoding", "gzip"), "encoding");
+    let response = testing::expect_ok(
+        router.dispatch("GET", "/", headers, Bytes::new()),
+        "dispatch",
+    );
+    testing::assert_eq(response.status, 200);
+    testing::assert_eq(response.headers.get("content-encoding").unwrap_or(""), "gzip");
+    testing::assert_eq(
+        response.headers.get("access-control-allow-origin").unwrap_or(""),
+        "https://consumer.example",
+    );
+    testing::assert_eq(response.bytes().as_slice().get(0), 31);
+    testing::assert_eq(response.bytes().as_slice().get(1), 139);
+}
