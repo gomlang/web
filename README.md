@@ -6,9 +6,8 @@ The design takes inspiration from [Axum](https://docs.rs/axum/latest/axum/). It 
 
 ## Using the library
 
-Use this checkout's `stage2/bin` toolchain, built with `just make`. Panic isolation
-requires the new `std::panic` API and panic-safe lexical cleanup, which are not yet
-available in the pinned stage0 release.
+Use GoML 0.1.56 or newer. The published toolchain includes the `std::panic` API
+and panic-safe lexical cleanup required by handler isolation.
 
 Declare a versioned dependency:
 
