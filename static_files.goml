@@ -3,7 +3,6 @@ package web;
 use std::bytes::{Bytes};
 use std::crypto::hash;
 use std::io;
-use std::num;
 use std::os::linux::fd;
 
 pub struct StaticFiles {
@@ -54,29 +53,44 @@ fn static_open(root: fd::Fd, name: string) -> Result[fd::Fd, io::Error] {
     directory.duplicate()
 }
 
-fn static_range(value: string, size: isize) -> Option[(isize, isize)] {
-    if !value.starts_with("bytes=") || value.contains(",") || size == 0 {
+fn static_range_number(value: string, ceiling: isize) -> Option[isize] {
+    if value == "" {
         return Option::None
     }
-    let (start, end) = value.byte_slice(6, value.byte_len()).split_once("-")?;
-    for text in Vec::from_array([start, end]) {
-        for byte in text.to_bytes() {
-            if byte < b'0' || byte > b'9' {
-                return Option::None
-            }
+    let mut result = 0;
+    for byte in value.to_bytes() {
+        if byte < b'0' || byte > b'9' {
+            return Option::None
+        }
+        let digit = (byte - b'0').to_isize();
+        if result > ceiling / 10 || (result == ceiling / 10 && digit > ceiling % 10) {
+            result = ceiling;
+        } else {
+            result = result * 10 + digit;
         }
     }
+    Option::Some(result)
+}
+
+fn static_range(value: string, size: isize) -> Option[(isize, isize)] {
+    let value = value.trim();
+    if value.contains(",") {
+        return Option::None
+    }
+    let (start, end) = value.split_once("-")?;
     if start == "" {
-        let count = match num::parse_int_structured(end) {
-            Ok(value) => value,
-            Err(_) => return Option::None,
+        let ceiling = if size == 0 {
+            1
+        } else {
+            size
         };
+        let count = static_range_number(end, ceiling)?;
         if count == 0 {
             return Option::None
         }
         return Option::Some(
             (
-                if count >= size {
+                if size == 0 {
                     0
                 } else {
                     size - count
@@ -85,21 +99,14 @@ fn static_range(value: string, size: isize) -> Option[(isize, isize)] {
             ),
         )
     }
-    let start = match num::parse_int_structured(start) {
-        Ok(value) => value,
-        Err(_) => return Option::None,
-    };
+    if size == 0 {
+        return Option::None
+    }
+    let start = static_range_number(start, size)?;
     let end = if end == "" {
         size - 1
     } else {
-        match num::parse_int_structured(end) {
-            Ok(value) => if value >= size {
-                size - 1
-            } else {
-                value
-            },
-            Err(_) => return Option::None,
-        }
+        static_range_number(end, size - 1)?
     };
     if start >= size || start > end {
         Option::None
@@ -227,12 +234,20 @@ impl StaticFiles {
         let ranges = request.headers().get_all("range");
         if request.method() == "GET" && !ranges.is_empty()
             && request.headers().get("if-range").unwrap_or(etag) == etag {
+            let value = ranges[0].trim();
+            let (unit, specification) = value.split_once("=").unwrap_or((value, ""));
+            if unit.to_ascii_lowercase() != "bytes" {
+                return Result::Ok(base.body(output))
+            }
             let range = if ranges.len() == 1 {
-                static_range(ranges[0], output.len())
+                static_range(specification, output.len())
             } else {
                 Option::None
             };
             if let Some((start, end)) = range {
+                if start == end {
+                    return Result::Ok(base.body(output))
+                }
                 let partial = Bytes::new();
                 partial.extend_from_slice(output.as_slice().sub(start, end));
                 return Result::Ok(

@@ -96,7 +96,15 @@ quoted opaque tags remain part of the tag; `*` is a wildcard only as the entire
 field value. HEAD ignores Range
 and reports the full representation length without a body. These checks follow
 [HTTP conditional and range semantics](https://www.rfc-editor.org/rfc/rfc9110.html#name-precedence-of-preconditions);
-date validators and multipart ranges are not supported.
+date validators and multipart ranges are not supported. Range units are
+case-insensitive; unknown units are ignored and receive the full 200 response.
+Byte positions use overflow-safe decimal parsing: oversized last positions
+clamp to the last byte, oversized suffix lengths select the whole file, and
+oversized first positions are unsatisfiable. Leading zeroes are accepted;
+nondigits, reversed ranges, zero suffix lengths, integer ranges on empty files
+and multiple byte ranges receive 416. A valid nonzero suffix range on an empty
+file is ignored and receives an empty 200 response. Numeric overflow never makes a valid suffix
+or last position fail ([RFC 9110, byte ranges](https://www.rfc-editor.org/rfc/rfc9110.html#section-14.1.2)).
 
 There is no directory listing or implicit index file. Descriptor-relative
 opening rejects symlinks, dotfiles and traversal components, including decoded
