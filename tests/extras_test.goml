@@ -262,7 +262,9 @@ fn static_preconditions_use_strong_matches_before_cache_and_ranges() -> () {
     let ordinary = extras_dispatch(router, "GET", "/file.txt", web::Headers::new(), Bytes::new());
     let etag = ordinary.headers.get("etag").unwrap_or("");
     for method in Vec::from_array(["GET", "HEAD"]) {
-        for value in Vec::from_array(["\"stale\"", "W/" + etag]) {
+        for value in Vec::from_array(
+            ["\"stale\"", "W/" + etag, "\"prefix,*,suffix\"", "*, " + etag],
+        ) {
             let headers = extras_header(
                 extras_header(
                     extras_header(web::Headers::new(), "if-match", value),
@@ -278,7 +280,9 @@ fn static_preconditions_use_strong_matches_before_cache_and_ranges() -> () {
             testing::assert(response.headers.get("content-range").is_none());
             testing::assert_eq(response.headers.get("etag").unwrap_or(""), etag);
         }
-        for value in Vec::from_array(["*", etag, "\"stale\", " + etag]) {
+        for value in Vec::from_array(
+            ["*", etag, "\"stale\", " + etag, "\"prefix,*,suffix\", " + etag],
+        ) {
             let headers = extras_header(web::Headers::new(), "if-match", value);
             let response = extras_dispatch(router, method, "/file.txt", headers, Bytes::new());
             testing::assert_eq(response.status, 200);
@@ -310,6 +314,15 @@ fn static_preconditions_use_strong_matches_before_cache_and_ranges() -> () {
             304,
         );
     }
+    let uncached = extras_dispatch(
+        router,
+        "GET",
+        "/file.txt",
+        extras_header(web::Headers::new(), "if-none-match", "\"prefix,*,suffix\""),
+        Bytes::new(),
+    );
+    testing::assert_eq(uncached.status, 200);
+    testing::assert_eq(testing::expect_ok(uncached.text(), "unmatched opaque tag"), "0123456789");
     for range in Vec::from_array(["bytes=2-4", "bytes=99-", "invalid"]) {
         let response = extras_dispatch(
             router,

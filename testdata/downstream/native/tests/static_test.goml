@@ -25,6 +25,17 @@ fn static_preconditions_and_head_ranges_work_over_http() -> () {
     testing::assert(failed.starts_with("HTTP/1.1 412 Precondition Failed\r\n"));
     testing::assert(!failed.contains("content-range:"));
     testing::assert(failed.ends_with("\r\n\r\n"));
+    let opaque = transport_request(
+        server,
+        "GET /file.txt HTTP/1.1\r\nHost: localhost\r\nIf-Match: \"prefix,*,suffix\"\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(opaque.starts_with("HTTP/1.1 412 Precondition Failed\r\n"));
+    let uncached = transport_request(
+        server,
+        "GET /file.txt HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: \"prefix,*,suffix\"\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(uncached.starts_with("HTTP/1.1 200 OK\r\n"));
+    testing::assert(uncached.ends_with("\r\n\r\n0123456789"));
     let head = transport_request(
         server,
         "HEAD /file.txt HTTP/1.1\r\nHost: localhost\r\nRange: bytes=2-4\r\nIf-Match: *\r\nConnection: close\r\n\r\n",
