@@ -17,7 +17,7 @@ Declare a versioned dependency:
 "ecosystem::web" = "0.1.0"
 ```
 
-Consumers supply a minimal `go.mod`, as shown in `consumer/go.mod`. They do not need a native dependency declaration or handwritten Go `require` or `replace` entries. The independent consumer under `consumer` exercises the dependency boundary.
+Consumers supply a minimal `go.mod`, as shown in `testdata/downstream/native/go.mod`. They do not need a native dependency declaration or handwritten Go `require` or `replace` entries. The native downstream fixture under `testdata/downstream/native` exercises the dependency boundary.
 
 ```goml
 use ecosystem::web::{Router, Response};
@@ -33,7 +33,7 @@ println(server.address()?);
 server.shutdown(Duration::from_seconds(3))?;
 ```
 
-`serve` binds before returning. Port zero requests an ephemeral port. Keep the application alive until its own shutdown signal, then call `shutdown` with a positive bound. The example above deliberately shuts down immediately; the consumer's `--serve` mode waits for standard input to close.
+`serve` binds before returning. Port zero requests an ephemeral port. Keep the application alive until its own shutdown signal, then call `shutdown` with a positive bound. The example above deliberately shuts down immediately; the downstream fixture's `--serve` mode waits for standard input to close.
 
 ## Routing and middleware
 
@@ -126,9 +126,9 @@ Run from this library repository:
 (cd ../verification && just ecosystem-test web)
 ```
 
-GoML black-box tests, versioned-consumer tests and cached rebuild checks cover
+GoML black-box tests, native downstream tests and cached rebuild checks cover
 routing, typed payloads, request/body limits and lifecycle.
-The consumer sends 120 generated Unicode query/form requests through
+The downstream fixture sends 120 generated Unicode query/form requests through
 `ecosystem::request`, exercises concurrent requests and checks real HTTP status
 codes and duplicate headers. GoML `std::process` invokes curl as an independent
 HTTP client for a 200 KiB chunked binary upload and a timed SSE disconnect; it then
@@ -142,7 +142,7 @@ under the race detector.
 
 `Router::serve_tls(address, TlsConfig::new(certificate_pem, private_key_pem))` starts an HTTPS listener with the same routing, streaming responses, limits and graceful shutdown behavior as `serve`. PEM inputs are `std::bytes::Bytes`; invalid certificates and keys fail before a listener is published. `with_minimum_version(tls::Version::Tls13)` raises the default TLS 1.2 minimum. `with_handshake_timeout(Duration)` controls each connection's positive handshake deadline (default ten seconds). Handshakes run per connection, so a stalled client does not block acceptance of other clients. ALPN advertises `http/1.1`.
 
-The TLS transport uses this module's Go standard-library adapter in `adapter/`; HTTP parsing and routing remain GoML code. Cancelling a context during a TLS read or write closes that connection and interrupts blocked transport work. Go 1.26 is required, with no cgo or third-party Go dependencies. The manifest's `[native]` declaration lets the driver select the adapter through a generated module file. Consumers must supply a minimal `go.mod`, as shown in `consumer/go.mod`; the driver leaves that file unchanged. The native transport's race tests run with `go test -race ./adapter`.
+The TLS transport uses this module's Go standard-library adapter in `adapter/`; HTTP parsing and routing remain GoML code. Cancelling a context during a TLS read or write closes that connection and interrupts blocked transport work. Go 1.26 is required, with no cgo or third-party Go dependencies. The manifest's `[native]` declaration lets the driver select the adapter through a generated module file. Consumers must supply a minimal `go.mod`, as shown in `testdata/downstream/native/go.mod`; the driver leaves that file unchanged. The native transport's race tests run with `go test -race ./adapter`.
 
 ### WebSocket upgrades
 
@@ -172,3 +172,14 @@ fn routes() -> web::Router {
 ```
 
 The handler receives the existing WebSocket connection API and a request context. Frames already buffered after HTTP headers are preserved. The handler runs within the configured request timeout, participates in graceful shutdown, and its connection closes when it returns or panics. Choose a suitable `Limits.request_timeout` for long sessions. Both TCP and TLS listeners support upgrades. HTTP dispatch/recording without a live connection rejects an upgrade, and upgrade responses cannot carry ordinary response bodies. WebSocket extensions are not negotiated.
+
+## Development and downstream checks
+
+Requires GoML 0.1.55 or newer. The independent native fixture is in `testdata/downstream/native/`; it retains a separate manifest and Go module for native dependencies. From the library root, run:
+
+```sh
+goml test
+goml verify --timeout 300s
+```
+
+`goml verify` builds and tests the fixture against an isolated registry snapshot. `(cd ../verification && just ecosystem-test web)` also runs the library-specific smoke and compatibility checks.

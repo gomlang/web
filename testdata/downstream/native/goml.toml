@@ -1,5 +1,5 @@
 [module]
-path = "consumer::web"
+path = "downstream::web"
 
 [dependencies]
 "ecosystem::websocket" = "0.1.0"

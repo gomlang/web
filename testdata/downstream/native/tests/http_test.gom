@@ -1,6 +1,6 @@
 package tests;
 
-use consumer::web as app;
+use downstream::web as app;
 use ecosystem::request;
 use std::bytes;
 use std::collections::{HashSet};
