@@ -108,6 +108,39 @@ fn static_range(value: string, size: isize) -> Option[(isize, isize)] {
     }
 }
 
+fn static_etag_matches(values: Vec[string], etag: string, weak: bool) -> bool {
+    let value = values.join(",");
+    if value.trim() == "*" {
+        return true
+    }
+    let mut quoted = false;
+    let mut start = 0;
+    let mut matched = false;
+    for index in 0..value.byte_len() + 1 {
+        if index < value.byte_len() {
+            let byte = value.byte_get(index);
+            if byte == b'"' {
+                quoted = !quoted;
+            }
+            if byte != b',' || quoted {
+                continue
+            }
+        }
+        if quoted {
+            return false
+        }
+        let candidate = value.byte_slice(start, index).trim();
+        if candidate == "*" {
+            return false
+        }
+        if candidate == etag || (weak && candidate == "W/" + etag) {
+            matched = true;
+        }
+        start = index + 1;
+    }
+    matched
+}
+
 impl StaticFiles {
     pub fn new(root: string, max_bytes: isize) -> Result[StaticFiles, Error] {
         if max_bytes < 0 {
@@ -185,27 +218,11 @@ impl StaticFiles {
             etag,
         ).header("accept-ranges", "bytes").header("x-content-type-options", "nosniff");
         let matches = request.headers().get_all("if-match");
-        if !matches.is_empty() {
-            let mut matched = false;
-            for value in matches {
-                for candidate in value.split(",") {
-                    let candidate = candidate.trim();
-                    if candidate == "*" || candidate == etag {
-                        matched = true;
-                    }
-                }
-            }
-            if !matched {
-                return Result::Ok(Response { status_value: 412, ..base })
-            }
+        if !matches.is_empty() && !static_etag_matches(matches, etag, false) {
+            return Result::Ok(Response { status_value: 412, ..base })
         }
-        for value in request.headers().get_all("if-none-match") {
-            for candidate in value.split(",") {
-                let candidate = candidate.trim();
-                if candidate == "*" || candidate == etag || candidate == "W/" + etag {
-                    return Result::Ok(Response { status_value: 304, ..base })
-                }
-            }
+        if static_etag_matches(request.headers().get_all("if-none-match"), etag, true) {
+            return Result::Ok(Response { status_value: 304, ..base })
         }
         let ranges = request.headers().get_all("range");
         if request.method() == "GET" && !ranges.is_empty()

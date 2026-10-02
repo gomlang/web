@@ -91,7 +91,9 @@ static root with `files.close()` after the server has shut down. Files are read
 under the configured byte bound, with MIME types, SHA-256 ETags, conditional
 GET/HEAD and a single GET byte range. `If-Match` uses strong ETag comparison
 (or `*`) and returns 412 on failure before evaluating `If-None-Match` or ranges.
-`If-None-Match` accepts weak ETags and returns 304 on a match. HEAD ignores Range
+`If-None-Match` accepts weak ETags and returns 304 on a match. Commas inside
+quoted opaque tags remain part of the tag; `*` is a wildcard only as the entire
+field value. HEAD ignores Range
 and reports the full representation length without a body. These checks follow
 [HTTP conditional and range semantics](https://www.rfc-editor.org/rfc/rfc9110.html#name-precedence-of-preconditions);
 date validators and multipart ranges are not supported.
