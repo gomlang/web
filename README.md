@@ -86,7 +86,20 @@ let router = Router::new().get("/assets/{*path}", files.handler("path"))
     .layer(compression(1024 * 1024)?);
 ```
 
-Import `StaticFiles`, `Cors` and `compression` from `ecosystem::web`. Close the static root with `files.close()` after the server has shut down. Files are read under the configured byte bound, with MIME types, SHA-256 ETags, conditional GET/HEAD and a single byte range. There is no directory listing or implicit index file. Descriptor-relative opening rejects symlinks, dotfiles and traversal components, including decoded route captures; only regular files are served. The implementation uses the existing Linux file-descriptor API.
+Import `StaticFiles`, `Cors` and `compression` from `ecosystem::web`. Close the
+static root with `files.close()` after the server has shut down. Files are read
+under the configured byte bound, with MIME types, SHA-256 ETags, conditional
+GET/HEAD and a single GET byte range. `If-Match` uses strong ETag comparison
+(or `*`) and returns 412 on failure before evaluating `If-None-Match` or ranges.
+`If-None-Match` accepts weak ETags and returns 304 on a match. HEAD ignores Range
+and reports the full representation length without a body. These checks follow
+[HTTP conditional and range semantics](https://www.rfc-editor.org/rfc/rfc9110.html#name-precedence-of-preconditions);
+date validators and multipart ranges are not supported.
+
+There is no directory listing or implicit index file. Descriptor-relative
+opening rejects symlinks, dotfiles and traversal components, including decoded
+route captures; only regular files are served. The implementation uses the
+existing Linux file-descriptor API.
 
 `Cors` validates explicit origins, methods and headers, handles preflight requests, and maintains `Vary: Origin`. Builders also configure exposed headers, credentials and preflight cache age. Credentialed requests require explicit origins; a wildcard origin cannot enable credentials. Disallowed origins, methods and requested headers receive 403.
 

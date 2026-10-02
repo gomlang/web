@@ -184,6 +184,21 @@ impl StaticFiles {
             "etag",
             etag,
         ).header("accept-ranges", "bytes").header("x-content-type-options", "nosniff");
+        let matches = request.headers().get_all("if-match");
+        if !matches.is_empty() {
+            let mut matched = false;
+            for value in matches {
+                for candidate in value.split(",") {
+                    let candidate = candidate.trim();
+                    if candidate == "*" || candidate == etag {
+                        matched = true;
+                    }
+                }
+            }
+            if !matched {
+                return Result::Ok(Response { status_value: 412, ..base })
+            }
+        }
         for value in request.headers().get_all("if-none-match") {
             for candidate in value.split(",") {
                 let candidate = candidate.trim();
@@ -193,7 +208,8 @@ impl StaticFiles {
             }
         }
         let ranges = request.headers().get_all("range");
-        if !ranges.is_empty() && request.headers().get("if-range").unwrap_or(etag) == etag {
+        if request.method() == "GET" && !ranges.is_empty()
+            && request.headers().get("if-range").unwrap_or(etag) == etag {
             let range = if ranges.len() == 1 {
                 static_range(ranges[0], output.len())
             } else {
