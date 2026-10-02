@@ -378,6 +378,27 @@ fn send_error(stream: ConnectionStream, error: Error, head: bool) -> () {
     );
 }
 
+fn drain_rejected_input(stream: ConnectionStream, input: Input, connection: context::Context) -> () {
+    if let ConnectionStream::Tcp(tcp) = stream {
+        let _ = tcp.shutdown(net::Shutdown::Write);
+    }
+    context::with_timeout(
+        connection,
+        Duration::from_milliseconds(500),
+        |context, _| {
+            let mut remaining = 1048576;
+            while remaining > 0 {
+                match input.take_with(remaining, context) {
+                    Ok(data) => {
+                        remaining -= data.len();
+                    },
+                    Err(_) => return,
+                }
+            }
+        },
+    );
+}
+
 fn pump(
     stream: ConnectionStream,
     lifetime: Lifetime,
@@ -553,6 +574,11 @@ fn serve_connection(
                     Err(error) => {
                         if error.kind != ErrorKind::Cancelled {
                             send_error(stream, error, false);
+                            drain_rejected_input(
+                                stream,
+                                queued_input(chunks, cursor, connection),
+                                connection,
+                            );
                         }
                         return
                     },
