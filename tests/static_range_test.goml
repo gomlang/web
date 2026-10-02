@@ -1,0 +1,98 @@
+package tests;
+
+use ecosystem::web;
+use std::bytes::{Bytes};
+use std::fs;
+use std::testing;
+
+#[test]
+fn static_ranges_accept_large_decimal_positions_without_losing_validation() -> () {
+    let root = "_artifact/static-range-numbers";
+    testing::assert_ok(fs::create_dir_all(root));
+    testing::assert_ok(fs::write_file_structured(root + "/file.txt", "0123456789"));
+    testing::assert_ok(fs::write_file_structured(root + "/empty.txt", ""));
+    let files = testing::expect_ok(web::StaticFiles::new(root, 100), "files");
+    defer {
+        let _ = files.close();
+    };
+    let router = web::Router::new().get("/{*path}", files.handler("path"));
+    let huge = "9".repeat(100);
+    for (value, body, range) in Vec::from_array(
+        [
+            ("bytes=0-0", "0", "bytes 0-0/10"),
+            ("ByTeS=2-4", "234", "bytes 2-4/10"),
+            ("bytes= \t0-0", "0", "bytes 0-0/10"),
+            ("bytes=2-" + huge, "23456789", "bytes 2-9/10"),
+            ("bytes=-" + huge, "0123456789", "bytes 0-9/10"),
+            ("bytes=0000002-0000004", "234", "bytes 2-4/10"),
+            ("bytes=-0003", "789", "bytes 7-9/10"),
+            ("bytes=0-18446744073709551616", "0123456789", "bytes 0-9/10"),
+            ("bytes=9-", "9", "bytes 9-9/10"),
+        ],
+    ) {
+        let response = extras_dispatch(
+            router,
+            "GET",
+            "/file.txt",
+            extras_header(web::Headers::new(), "range", value),
+            Bytes::new(),
+        );
+        testing::assert_eq(response.status, 206);
+        testing::assert_eq(response.headers.get("content-range").unwrap_or(""), range);
+        testing::assert(response.bytes().to_vec_copy() == body.to_bytes());
+    }
+    for value in Vec::from_array(
+        [
+            "bytes=" + huge + "-",
+            "bytes=2-" + huge + "x",
+            "bytes=-" + huge + "x",
+            "bytes=-0",
+            "bytes=4-2",
+            "bytes=+1-2",
+            "bytes=--1",
+            "bytes=-",
+            "bytes=10-",
+            "bytes=0-1,4-5",
+        ],
+    ) {
+        let response = extras_dispatch(
+            router,
+            "GET",
+            "/file.txt",
+            extras_header(web::Headers::new(), "range", value),
+            Bytes::new(),
+        );
+        testing::assert_eq(response.status, 416);
+        testing::assert_eq(response.headers.get("content-range").unwrap_or(""), "bytes */10");
+        testing::assert(response.bytes().is_empty());
+    }
+    for (value, status) in Vec::from_array(
+        [("bytes=0-0", 416), ("bytes=-0", 416), ("bytes=-1", 200), ("bytes=-" + huge, 200)],
+    ) {
+        let response = extras_dispatch(
+            router,
+            "GET",
+            "/empty.txt",
+            extras_header(web::Headers::new(), "range", value),
+            Bytes::new(),
+        );
+        testing::assert_eq(response.status, status);
+        if status == 416 {
+            testing::assert_eq(response.headers.get("content-range").unwrap_or(""), "bytes */0");
+        } else {
+            testing::assert(response.headers.get("content-range").is_none());
+        }
+        testing::assert(response.bytes().is_empty());
+    }
+    for path in Vec::from_array(["/file.txt", "/empty.txt"]) {
+        let response = extras_dispatch(
+            router,
+            "GET",
+            path,
+            extras_header(web::Headers::new(), "range", "items=0-4"),
+            Bytes::new(),
+        );
+        testing::assert_eq(response.status, 200);
+        testing::assert(response.headers.get("content-range").is_none());
+    }
+}

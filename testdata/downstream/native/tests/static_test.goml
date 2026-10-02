@@ -52,3 +52,57 @@ fn static_preconditions_and_head_ranges_work_over_http() -> () {
     testing::assert(range.to_ascii_lowercase().contains("content-range: bytes 2-4/10\r\n"));
     testing::assert(range.ends_with("\r\n\r\n234"));
 }
+
+#[test]
+fn static_range_numeric_boundaries_and_unknown_units_work_over_http() -> () {
+    let root = "_artifact/static-range-http";
+    testing::assert_ok(fs::create_dir_all(root));
+    testing::assert_ok(fs::write_file_structured(root + "/file.txt", "0123456789"));
+    testing::assert_ok(fs::write_file_structured(root + "/empty.txt", ""));
+    let files = testing::expect_ok(web::StaticFiles::new(root, 100), "static files");
+    defer {
+        let _ = files.close();
+    };
+    let server = transport_server(web::Router::new().get("/{*path}", files.handler("path")));
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    for (value, status, body, length, range) in Vec::from_array(
+        [
+            ("bytes=2-99999999999999999999999999", "206", "23456789", "8", "bytes 2-9/10"),
+            ("bytes=-99999999999999999999999999", "206", "0123456789", "10", "bytes 0-9/10"),
+            ("BYTES=0-0", "206", "0", "1", "bytes 0-0/10"),
+            ("bytes=99999999999999999999999999-", "416", "", "0", "bytes */10"),
+            ("bytes=2-99999999999999999999999999x", "416", "", "0", "bytes */10"),
+            ("items=0-1", "200", "0123456789", "10", ""),
+        ],
+    ) {
+        let response = transport_request(
+            server,
+            "GET /file.txt HTTP/1.1\r\nHost: localhost\r\nRange: " + value
+                + "\r\nConnection: close\r\n\r\n",
+        );
+        testing::assert(response.starts_with("HTTP/1.1 " + status + " "));
+        testing::assert(response.contains("content-length: " + length + "\r\n"));
+        testing::assert(response.ends_with("\r\n\r\n" + body));
+        if range == "" {
+            testing::assert(!response.contains("content-range:"));
+        } else {
+            testing::assert(response.contains("content-range: " + range + "\r\n"));
+        }
+    }
+    let empty = transport_request(
+        server,
+        "GET /empty.txt HTTP/1.1\r\nHost: localhost\r\nRange: bytes=0-0\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(empty.starts_with("HTTP/1.1 416 "));
+    testing::assert(empty.contains("content-range: bytes */0\r\n"));
+    testing::assert(empty.ends_with("\r\n\r\n"));
+    let suffix = transport_request(
+        server,
+        "GET /empty.txt HTTP/1.1\r\nHost: localhost\r\nRange: bytes=-99999999999999999999999999\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(suffix.starts_with("HTTP/1.1 200 "));
+    testing::assert(!suffix.contains("content-range:"));
+    testing::assert(suffix.ends_with("\r\n\r\n"));
+}
