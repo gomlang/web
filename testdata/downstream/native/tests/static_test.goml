@@ -1,0 +1,43 @@
+package tests;
+
+use ecosystem::web;
+use std::fs;
+use std::testing;
+use std::time::{Duration};
+
+#[test]
+fn static_preconditions_and_head_ranges_work_over_http() -> () {
+    let root = "_artifact/static-preconditions-http";
+    testing::assert_ok(fs::create_dir_all(root));
+    testing::assert_ok(fs::write_file_structured(root + "/file.txt", "0123456789"));
+    let files = testing::expect_ok(web::StaticFiles::new(root, 100), "static files");
+    defer {
+        let _ = files.close();
+    };
+    let server = transport_server(web::Router::new().get("/{*path}", files.handler("path")));
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    let failed = transport_request(
+        server,
+        "GET /file.txt HTTP/1.1\r\nHost: localhost\r\nIf-Match: \"stale\"\r\nRange: bytes=2-4\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(failed.starts_with("HTTP/1.1 412 Precondition Failed\r\n"));
+    testing::assert(!failed.contains("content-range:"));
+    testing::assert(failed.ends_with("\r\n\r\n"));
+    let head = transport_request(
+        server,
+        "HEAD /file.txt HTTP/1.1\r\nHost: localhost\r\nRange: bytes=2-4\r\nIf-Match: *\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(head.starts_with("HTTP/1.1 200 OK\r\n"));
+    testing::assert(head.to_ascii_lowercase().contains("content-length: 10\r\n"));
+    testing::assert(!head.contains("content-range:"));
+    testing::assert(head.ends_with("\r\n\r\n"));
+    let range = transport_request(
+        server,
+        "GET /file.txt HTTP/1.1\r\nHost: localhost\r\nRange: bytes=2-4\r\nIf-Match: *\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(range.starts_with("HTTP/1.1 206 "));
+    testing::assert(range.to_ascii_lowercase().contains("content-range: bytes 2-4/10\r\n"));
+    testing::assert(range.ends_with("\r\n\r\n234"));
+}

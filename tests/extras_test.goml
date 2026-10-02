@@ -248,3 +248,97 @@ fn static_files_support_ranges_etags_and_reject_traversal_and_symlinks() -> () {
         extras_dispatch(router, "HEAD", "/file.txt", web::Headers::new(), Bytes::new()).bytes().is_empty(),
     );
 }
+
+#[test]
+fn static_preconditions_use_strong_matches_before_cache_and_ranges() -> () {
+    let root = "_artifact/static-preconditions-regression";
+    testing::assert_ok(fs::create_dir_all(root));
+    testing::assert_ok(fs::write_file_structured(root + "/file.txt", "0123456789"));
+    let files = testing::expect_ok(web::StaticFiles::new(root, 100), "static root");
+    defer {
+        let _ = files.close();
+    };
+    let router = web::Router::new().get("/{*path}", files.handler("path"));
+    let ordinary = extras_dispatch(router, "GET", "/file.txt", web::Headers::new(), Bytes::new());
+    let etag = ordinary.headers.get("etag").unwrap_or("");
+    for method in Vec::from_array(["GET", "HEAD"]) {
+        for value in Vec::from_array(["\"stale\"", "W/" + etag]) {
+            let headers = extras_header(
+                extras_header(
+                    extras_header(web::Headers::new(), "if-match", value),
+                    "if-none-match",
+                    etag,
+                ),
+                "range",
+                "bytes=2-4",
+            );
+            let response = extras_dispatch(router, method, "/file.txt", headers, Bytes::new());
+            testing::assert_eq(response.status, 412);
+            testing::assert(response.bytes().is_empty());
+            testing::assert(response.headers.get("content-range").is_none());
+            testing::assert_eq(response.headers.get("etag").unwrap_or(""), etag);
+        }
+        for value in Vec::from_array(["*", etag, "\"stale\", " + etag]) {
+            let headers = extras_header(web::Headers::new(), "if-match", value);
+            let response = extras_dispatch(router, method, "/file.txt", headers, Bytes::new());
+            testing::assert_eq(response.status, 200);
+            testing::assert_eq(
+                response.bytes().len(),
+                if method == "GET" {
+                    10
+                } else {
+                    0
+                },
+            );
+        }
+        let repeated = extras_header(
+            extras_header(web::Headers::new(), "if-match", "\"stale\""),
+            "if-match",
+            etag,
+        );
+        testing::assert_eq(
+            extras_dispatch(router, method, "/file.txt", repeated, Bytes::new()).status,
+            200,
+        );
+        let cached = extras_header(
+            extras_header(web::Headers::new(), "if-match", etag),
+            "if-none-match",
+            "W/" + etag,
+        );
+        testing::assert_eq(
+            extras_dispatch(router, method, "/file.txt", cached, Bytes::new()).status,
+            304,
+        );
+    }
+    for range in Vec::from_array(["bytes=2-4", "bytes=99-", "invalid"]) {
+        let response = extras_dispatch(
+            router,
+            "HEAD",
+            "/file.txt",
+            extras_header(web::Headers::new(), "range", range),
+            Bytes::new(),
+        );
+        testing::assert_eq(response.status, 200);
+        testing::assert(response.headers.get("content-range").is_none());
+        testing::assert(response.bytes().is_empty());
+    }
+    let partial = extras_dispatch(
+        router,
+        "GET",
+        "/file.txt",
+        extras_header(extras_header(web::Headers::new(), "if-match", etag), "range", "bytes=2-4"),
+        Bytes::new(),
+    );
+    testing::assert_eq(partial.status, 206);
+    testing::assert_eq(testing::expect_ok(partial.text(), "partial body"), "234");
+    testing::assert_eq(
+        extras_dispatch(
+            router,
+            "GET",
+            "/missing.txt",
+            extras_header(web::Headers::new(), "if-match", "*"),
+            Bytes::new(),
+        ).status,
+        404,
+    );
+}
