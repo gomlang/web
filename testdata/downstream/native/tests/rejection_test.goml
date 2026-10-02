@@ -1,0 +1,180 @@
+package tests;
+
+use ecosystem::web;
+use ecosystem::request;
+use std::bytes::{Bytes};
+use std::context;
+use std::ffi;
+use std::io;
+use std::net::{SocketAddr};
+use std::net::tls;
+use std::task;
+use std::testing;
+use std::time::{Duration, Timer};
+
+fn rejection_router() -> web::Router {
+    web::Router::new().post("/", |_| Result::Ok(web::Response::text(200, "accepted"))).limits(
+        web::Limits { body_bytes: 262144, ..web::Limits::new() },
+    )
+}
+
+fn rejection_headers() -> string {
+    "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 262145\r\nConnection: close\r\n\r\n"
+}
+
+fn rejection_tls_server() -> (web::Server, Bytes) {
+    let (certificate, key, error) = test_certificate();
+    testing::assert(ffi::error_is_nil(error));
+    let certificate = Bytes::from_vec(ffi::slice_to_vec_copy(certificate));
+    let server = testing::expect_ok(
+        rejection_router().serve_tls(
+            "127.0.0.1:0",
+            web::TlsConfig::new(certificate, Bytes::from_vec(ffi::slice_to_vec_copy(key))),
+        ),
+        "TLS rejection server",
+    );
+    (server, certificate)
+}
+
+fn rejection_tls_connect(server: web::Server, certificate: Bytes) -> tls::TlsStream {
+    let address = testing::expect_ok(server.address(), "TLS rejection address");
+    let port = testing::expect_ok(SocketAddr::parse(address), "TLS rejection socket").port;
+    testing::expect_ok(
+        tls::connect(
+            "127.0.0.1",
+            port,
+            tls::ClientConfig::new("localhost").with_ca_pem(certificate.as_slice()),
+        ),
+        "TLS rejection connection",
+    )
+}
+
+fn rejection_tls_closed(stream: tls::TlsStream, context: context::Context) -> string {
+    let buffer = Vec::from_array([0.to_u8(); 4096]);
+    let output = Vec::new();
+    loop {
+        match stream.read_with(buffer.as_mut_slice(), context) {
+            Ok(0) => break,
+            Ok(count) => output.extend(buffer.slice(0, count).to_vec()),
+            Err(error) => {
+                testing::assert(error.kind() != io::ErrorKind::TimedOut);
+                testing::assert(error.kind() != io::ErrorKind::Interrupted);
+                break
+            },
+        }
+        testing::assert(output.len() < 4096);
+    }
+    string_from_utf8(output).1
+}
+
+#[test]
+fn rejected_tls_complete_upload_returns_413() -> () {
+    let (server, certificate) = rejection_tls_server();
+    defer testing::assert_ok(server.shutdown(Duration::from_seconds(2)));
+    let client = testing::expect_ok(
+        request::Client::builder().add_root_certificate(
+            string_from_utf8(certificate.to_vec_copy()).1,
+        ).build(),
+        "TLS upload client",
+    );
+    defer client.close();
+    let address = testing::expect_ok(server.address(), "TLS upload address");
+    let response = testing::expect_ok(
+        client.post("https://" + address + "/").text("x".repeat(262145)).send(),
+        "TLS complete oversized upload",
+    );
+    testing::assert_eq(response.status().as_isize(), 413);
+}
+
+#[test]
+fn rejected_tls_missing_and_slow_bodies_have_an_absolute_close_deadline() -> () {
+    let (server, certificate) = rejection_tls_server();
+    defer testing::assert_ok(server.shutdown(Duration::from_seconds(2)));
+    for slow in Vec::from_array([false, true]) {
+        let stream = rejection_tls_connect(server, certificate);
+        defer {
+            let _ = stream.close();
+        };
+        context::with_timeout(
+            context::Context::background(),
+            Duration::from_seconds(2),
+            |context, _| {
+                testing::assert_ok(
+                    stream.write_all_with(rejection_headers().to_bytes().as_slice(), context),
+                );
+                task::scope(
+                    |scope| {
+                        defer scope.cancel();
+                        if slow {
+                            let _ = scope.spawn(
+                                |token| {
+                                    let context = context::Context::from_token(token);
+                                    loop {
+                                        let tick = Timer::new(Duration::from_milliseconds(20));
+                                        let ready = select {
+                                            recv(tick.done()) as _ => true,
+                                            recv(token.done()) as _ => false,
+                                        };
+                                        let _ = tick.stop();
+                                        if !ready
+                                            || stream.write_all_with(b"x".as_slice(), context).is_err() {
+                                            return
+                                        }
+                                    }
+                                },
+                            );
+                        }
+                        testing::assert(
+                            rejection_tls_closed(stream, context).starts_with("HTTP/1.1 413 "),
+                        );
+                    },
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn rejected_tcp_body_drain_is_cancelled_by_shutdown() -> () {
+    let server = transport_server(rejection_router());
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    let stream = transport_connect(server);
+    defer {
+        let _ = stream.close();
+    };
+    transport_send(stream, rejection_headers());
+    testing::assert(transport_head(stream).starts_with("HTTP/1.1 413 "));
+    testing::assert_ok(server.shutdown(Duration::from_milliseconds(300)));
+}
+
+#[test]
+fn rejected_tls_body_drain_is_cancelled_by_shutdown() -> () {
+    let (server, certificate) = rejection_tls_server();
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    let stream = rejection_tls_connect(server, certificate);
+    defer {
+        let _ = stream.close();
+    };
+    context::with_timeout(
+        context::Context::background(),
+        Duration::from_seconds(2),
+        |context, _| {
+            testing::assert_ok(
+                stream.write_all_with(rejection_headers().to_bytes().as_slice(), context),
+            );
+            let byte = Vec::from_array([0.to_u8()]);
+            let mut head = "";
+            while !head.ends_with("\r\n\r\n") {
+                testing::assert_ok(stream.read_exact_with(byte.as_mut_slice(), context));
+                head += string_from_utf8(byte).1;
+                testing::assert(head.byte_len() < 4096);
+            }
+            testing::assert(head.starts_with("HTTP/1.1 413 "));
+            testing::assert_ok(server.shutdown(Duration::from_milliseconds(300)));
+        },
+    );
+}
