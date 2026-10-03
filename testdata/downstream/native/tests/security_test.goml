@@ -1,0 +1,139 @@
+package tests;
+
+use ecosystem::request;
+use ecosystem::web;
+use std::testing;
+use std::time::{Duration};
+
+#[test]
+fn actual_http_sessions_csrf_rotation_logout_and_peer_limits() -> () {
+    let cookie_policy = web::SessionCookie::new().with_name("local_session").with_secure(false).with_same_site(
+        web::SameSite::Strict,
+    );
+    let sessions = testing::expect_ok(
+        web::SessionStore::new(
+            web::SessionOptions { cookie: cookie_policy, ..web::SessionOptions::new() },
+        ),
+        "sessions",
+    );
+    let csrf = testing::expect_ok(
+        web::Csrf::new(Vec::from_array(["http://app.example"])).layer(),
+        "csrf",
+    );
+    let router = web::Router::new().get(
+        "/token",
+        |req| Result::Ok(web::Response::text(200, req.session()?.csrf_token()?)),
+    ).post(
+        "/rotate",
+        |req| {
+            req.session()?.rotate()?;
+            req.session()?.insert("name", "consumer")?;
+            Result::Ok(web::Response::text(200, req.session()?.csrf_token()?))
+        },
+    ).get(
+        "/name",
+        |req| Result::Ok(
+            web::Response::text(200, req.session()?.get("name")?.unwrap_or("anonymous")),
+        ),
+    ).post(
+        "/logout",
+        |req| {
+            req.session()?.logout()?;
+            Result::Ok(web::Response::new(204))
+        },
+    ).layer(sessions.layer()).layer(csrf);
+    let server = testing::expect_ok(router.serve("127.0.0.1:0"), "serve security routes");
+    defer {
+        testing::assert_ok(server.shutdown(Duration::from_seconds(2)));
+    };
+    let base = "http://" + testing::expect_ok(server.address(), "address");
+    let client = testing::expect_ok(
+        request::Client::builder().redirect(request::RedirectPolicy::None).build(),
+        "client",
+    );
+    defer client.close();
+    let first = testing::expect_ok(client.get(base + "/token").send(), "get token");
+    let cookie = testing::expect_some(first.headers().get("set-cookie"), "cookie").split(";")[0];
+    let token = testing::expect_ok(first.text(), "token");
+    testing::assert_eq(
+        testing::expect_ok(
+            client.post(base + "/rotate").header("cookie", cookie).send(),
+            "missing csrf",
+        ).status().as_isize(),
+        403,
+    );
+    let rotated = testing::expect_ok(
+        client.post(base + "/rotate").header("cookie", cookie).header(
+            "origin",
+            "http://app.example",
+        ).header("x-csrf-token", token).send(),
+        "rotate",
+    );
+    testing::assert_eq(rotated.status().as_isize(), 200);
+    let new_cookie = testing::expect_some(rotated.headers().get("set-cookie"), "rotated cookie").split(
+        ";",
+    )[0];
+    let new_token = testing::expect_ok(rotated.text(), "new token");
+    testing::assert(new_cookie != cookie);
+    testing::assert(new_token != token);
+    testing::assert_eq(
+        testing::expect_ok(
+            testing::expect_ok(
+                client.get(base + "/name").header("cookie", new_cookie).send(),
+                "stored name",
+            ).text(),
+            "body",
+        ),
+        "consumer",
+    );
+    testing::assert_eq(
+        testing::expect_ok(
+            testing::expect_ok(
+                client.get(base + "/name").header("cookie", cookie).send(),
+                "old session rejected",
+            ).text(),
+            "body",
+        ),
+        "anonymous",
+    );
+    let logout = testing::expect_ok(
+        client.post(base + "/logout").header("cookie", new_cookie).header(
+            "origin",
+            "http://app.example",
+        ).header("x-csrf-token", new_token).send(),
+        "logout",
+    );
+    testing::assert_eq(logout.status().as_isize(), 204);
+    testing::assert(logout.headers().get("set-cookie").unwrap_or("").contains("Max-Age=0"));
+    let limits = testing::expect_ok(
+        web::RateLimiter::with_clock(
+            web::RateLimitOptions { burst: 1, ..web::RateLimitOptions::new() },
+            || 0,
+        ),
+        "limiter",
+    );
+    let limited = testing::expect_ok(
+        web::Router::new().get("/", |_| Result::Ok(web::Response::new(200))).layer(limits.layer()).serve(
+            "127.0.0.1:0",
+        ),
+        "limited server",
+    );
+    defer {
+        testing::assert_ok(limited.shutdown(Duration::from_seconds(2)));
+    };
+    let url = "http://" + testing::expect_ok(limited.address(), "limited address") + "/";
+    testing::assert_eq(
+        testing::expect_ok(
+            client.get(url).header("x-forwarded-for", "192.0.2.1").send(),
+            "first peer request",
+        ).status().as_isize(),
+        200,
+    );
+    let denied = testing::expect_ok(
+        client.get(url).header("x-forwarded-for", "192.0.2.2").header("forwarded", "for=192.0.2.3").send(),
+        "spoofed forwarding headers",
+    );
+    testing::assert_eq(denied.status().as_isize(), 429);
+    testing::assert(denied.headers().get("retry-after") == Option::Some("1"));
+    testing::assert_eq(limits.len(), 1);
+}

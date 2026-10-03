@@ -1,0 +1,495 @@
+package tests;
+
+use ecosystem::web;
+use std::bytes::{Bytes};
+use std::task;
+use std::testing;
+
+fn security_headers(cookie: string, token: string, origin: string) -> web::Headers {
+    let mut headers = web::Headers::new();
+    if cookie != "" {
+        headers = testing::expect_ok(headers.append("cookie", cookie), "cookie");
+    }
+    if token != "" {
+        headers = testing::expect_ok(headers.append("x-csrf-token", token), "token");
+    }
+    if origin != "" {
+        headers = testing::expect_ok(headers.append("origin", origin), "origin");
+    }
+    headers
+}
+
+fn security_dispatch(router: web::Router, method: string, path: string, headers: web::Headers) -> web::CapturedResponse {
+    testing::expect_ok(router.dispatch(method, path, headers, Bytes::new()), "security dispatch")
+}
+
+fn security_cookie(response: web::CapturedResponse) -> string {
+    testing::expect_some(response.headers.get("set-cookie"), "session cookie").split(";")[0]
+}
+
+fn security_app(store: web::SessionStore) -> web::Router {
+    let csrf = testing::expect_ok(
+        web::Csrf::new(Vec::from_array(["https://app.example"])).layer(),
+        "csrf",
+    );
+    web::Router::new().get(
+        "/token",
+        |request| {
+            Result::Ok(web::Response::text(200, request.session()?.csrf_token()?))
+        },
+    ).post(
+        "/login",
+        |request| {
+            let session = request.session()?;
+            session.rotate()?;
+            session.insert("user", "alice")?;
+            Result::Ok(web::Response::text(200, session.csrf_token()?))
+        },
+    ).get(
+        "/account",
+        |request| {
+            match request.session()?.get("user")? {
+                Option::Some(user) => Result::Ok(web::Response::text(200, user)),
+                None => Result::Ok(web::Response::text(401, "login required")),
+            }
+        },
+    ).post(
+        "/logout",
+        |request| {
+            request.session()?.logout()?;
+            Result::Ok(web::Response::new(204))
+        },
+    ).layer(store.layer()).layer(csrf)
+}
+
+#[test]
+fn session_rotation_logout_csrf_and_cookie_policy() -> () {
+    let store = testing::expect_ok(web::SessionStore::new(web::SessionOptions::new()), "store");
+    let router = security_app(store);
+    let initial = security_dispatch(router, "GET", "/token", web::Headers::new());
+    let cookie = security_cookie(initial);
+    let token = testing::expect_ok(initial.text(), "token");
+    testing::assert_eq(cookie.byte_len(), "__Host-goml_session=".byte_len() + 64);
+    testing::assert_eq(token.byte_len(), 64);
+    testing::assert(cookie != "__Host-goml_session=" + token);
+    testing::assert(initial.headers.get("cache-control") == Option::Some("no-store"));
+    testing::assert_eq(
+        initial.headers.get("set-cookie").unwrap_or(""),
+        cookie + "; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax; Secure",
+    );
+    for headers in Vec::from_array(
+        [
+            security_headers(cookie, "", "https://app.example"),
+            security_headers(cookie, token, ""),
+            security_headers(cookie, token, "null"),
+            security_headers(cookie, token, "https://evil.example"),
+            security_headers(cookie, token, "https://app.example.evil.example"),
+            security_headers(cookie, "a".repeat(64), "https://app.example"),
+            security_headers(cookie, token + "0", "https://app.example"),
+            testing::expect_ok(
+                security_headers(cookie, token, "https://app.example").append(
+                    "origin",
+                    "https://app.example",
+                ),
+                "duplicate origin",
+            ),
+            testing::expect_ok(
+                security_headers(cookie, token, "https://app.example").append("x-csrf-token", token),
+                "duplicate token",
+            ),
+        ],
+    ) {
+        testing::assert_eq(security_dispatch(router, "POST", "/login", headers).status, 403);
+    }
+    let login = security_dispatch(
+        router,
+        "POST",
+        "/login",
+        security_headers(cookie, token, "https://app.example"),
+    );
+    testing::assert_eq(login.status, 200);
+    let rotated = security_cookie(login);
+    let new_token = testing::expect_ok(login.text(), "rotated csrf token");
+    testing::assert(rotated != cookie);
+    testing::assert(new_token != token);
+    testing::assert_eq(store.len(), 1);
+    testing::assert_eq(
+        security_dispatch(router, "GET", "/account", security_headers(cookie, "", "")).status,
+        401,
+    );
+    testing::assert_eq(
+        security_dispatch(router, "GET", "/account", security_headers(rotated, "", "")).status,
+        200,
+    );
+    testing::assert_eq(
+        security_dispatch(
+            router,
+            "POST",
+            "/logout",
+            security_headers(rotated, token, "https://app.example"),
+        ).status,
+        403,
+    );
+    let logout = security_dispatch(
+        router,
+        "POST",
+        "/logout",
+        security_headers(rotated, new_token, "https://app.example"),
+    );
+    testing::assert_eq(logout.status, 204);
+    testing::assert(
+        logout.headers.get("set-cookie")
+            == Option::Some(
+                "__Host-goml_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure",
+            ),
+    );
+    testing::assert_eq(
+        security_dispatch(router, "GET", "/account", security_headers(rotated, "", "")).status,
+        401,
+    );
+    let duplicate = security_headers(cookie + "; " + cookie, "", "");
+    testing::assert_eq(security_dispatch(router, "GET", "/token", duplicate).status, 400);
+    for ambiguous in Vec::from_array(
+        [
+            "__Host-goml_session =a; " + cookie,
+            "__Host-goml_session\t=a; " + cookie,
+            "__Host-goml_session=\"a\"; " + cookie,
+        ],
+    ) {
+        testing::assert_eq(
+            security_dispatch(router, "GET", "/token", security_headers(ambiguous, "", "")).status,
+            400,
+        );
+    }
+    let duplicate_headers = testing::expect_ok(
+        security_headers(cookie, "", "").append("cookie", cookie),
+        "second cookie header",
+    );
+    testing::assert_eq(security_dispatch(router, "GET", "/token", duplicate_headers).status, 400);
+    for supplied in Vec::from_array(
+        ["attacker", "a".repeat(64), "\"" + cookie + "\"", "a".repeat(65)],
+    ) {
+        let response = security_dispatch(
+            router,
+            "GET",
+            "/token",
+            security_headers("__Host-goml_session=" + supplied, "", ""),
+        );
+        testing::assert_eq(response.status, 200);
+        testing::assert(security_cookie(response) != "__Host-goml_session=" + supplied);
+    }
+    store.clear();
+    testing::assert_eq(store.len(), 0);
+}
+
+#[test]
+fn session_expiration_capacity_bounds_and_ended_handles() -> () {
+    let now: Ref[i64] = Ref::new(0);
+    let options = web::SessionOptions {
+        capacity: 1,
+        idle_seconds: 2,
+        lifetime_seconds: 5,
+        max_fields: 2,
+        max_data_bytes: 6,
+        ..web::SessionOptions::new(),
+    };
+    let store = testing::expect_ok(web::SessionStore::with_clock(options, || now.get()), "store");
+    let saved: Ref[Option[web::Session]] = Ref::new(Option::None);
+    let router = web::Router::new().get(
+        "/",
+        |request| {
+            let session = request.session()?;
+            saved.set(Option::Some(session));
+            session.remove("c")?;
+            session.insert("a", "1")?;
+            session.insert("b", "22")?;
+            testing::assert_err(session.insert("c", ""));
+            testing::assert_err(session.insert("b", "22222"));
+            testing::assert(session.get("b")? == Option::Some("22"));
+            session.remove("a")?;
+            session.insert("c", "3")?;
+            Result::Ok(web::Response::text(200, session.csrf_token()?))
+        },
+    ).layer(store.layer());
+    let first = security_dispatch(router, "GET", "/", web::Headers::new());
+    let cookie = security_cookie(first);
+    testing::assert_err(testing::expect_some(saved.get(), "saved handle").get("b"));
+    testing::assert_eq(security_dispatch(router, "GET", "/", web::Headers::new()).status, 503);
+    now.set(1000);
+    let same = security_dispatch(router, "GET", "/", security_headers(cookie, "", ""));
+    testing::assert(same.headers.get("set-cookie").is_none());
+    now.set(0);
+    testing::assert(
+        security_dispatch(router, "GET", "/", security_headers(cookie, "", "")).headers.get(
+            "set-cookie",
+        ).is_none(),
+    );
+    now.set(3000);
+    let expired = security_dispatch(router, "GET", "/", security_headers(cookie, "", ""));
+    testing::assert(security_cookie(expired) != cookie);
+    let cookie = security_cookie(expired);
+    for tick in Vec::from_array([4000, 5000, 6000, 7000]) {
+        now.set(tick);
+        testing::assert(
+            security_dispatch(router, "GET", "/", security_headers(cookie, "", "")).headers.get(
+                "set-cookie",
+            ).is_none(),
+        );
+    }
+    now.set(8000);
+    testing::assert(
+        security_cookie(security_dispatch(router, "GET", "/", security_headers(cookie, "", "")))
+            != cookie,
+    );
+    now.set(10000);
+    testing::assert_eq(store.len(), 0);
+}
+
+#[test]
+fn security_configuration_and_csrf_safe_methods() -> () {
+    for cookie in Vec::from_array(
+        [
+            web::SessionCookie::new().with_secure(false),
+            web::SessionCookie::new().with_domain("example.com"),
+            web::SessionCookie::new().with_path("/app"),
+            web::SessionCookie::new().with_name("bad;name"),
+            web::SessionCookie::new().with_path("/; HttpOnly"),
+            web::SessionCookie::new().with_name("session").with_secure(false).with_same_site(
+                web::SameSite::None,
+            ),
+            web::SessionCookie::new().with_name("session").with_domain("example.com; Secure"),
+        ],
+    ) {
+        testing::assert_err(
+            web::SessionStore::new(web::SessionOptions { cookie, ..web::SessionOptions::new() }),
+        );
+    }
+    testing::assert_err(
+        web::SessionStore::new(web::SessionOptions { capacity: 0, ..web::SessionOptions::new() }),
+    );
+    for origin in Vec::from_array(
+        [
+            "*",
+            "null",
+            "https://app.example/",
+            "https://app.example/path",
+            "https://user@app.example",
+            "https://app.example?x",
+            "https://app.example#x",
+            "ftp://app.example",
+            "https://*.example",
+        ],
+    ) {
+        testing::assert_err(web::Csrf::new(Vec::from_array([origin])).layer());
+    }
+    testing::assert_err(web::Csrf::new(Vec::new()).layer());
+    testing::assert_err(
+        web::Csrf::new(Vec::from_array(["https://app.example"])).with_header("bad\nname").layer(),
+    );
+    let store = testing::expect_ok(web::SessionStore::new(web::SessionOptions::new()), "store");
+    let router = security_app(store);
+    for method in Vec::from_array(["GET", "HEAD", "OPTIONS"]) {
+        testing::assert(
+            security_dispatch(router, method, "/token", web::Headers::new()).status < 400,
+        );
+    }
+    for method in Vec::from_array(["POST", "PUT", "PATCH", "DELETE", "CUSTOM"]) {
+        testing::assert_eq(
+            security_dispatch(router, method, "/token", web::Headers::new()).status,
+            403,
+        );
+    }
+}
+
+#[test]
+fn token_bucket_refill_rollback_eviction_and_cardinality() -> () {
+    let now: Ref[i64] = Ref::new(0);
+    let options = web::RateLimitOptions {
+        burst: 2,
+        refill_milliseconds: 1500,
+        idle_milliseconds: 3000,
+        max_keys: 1,
+        max_key_bytes: 4,
+    };
+    let limiter = testing::expect_ok(web::RateLimiter::with_clock(options, || now.get()), "limiter");
+    testing::assert_err(limiter.check(""));
+    testing::assert_err(limiter.check("12345"));
+    testing::assert_eq(testing::expect_ok(limiter.check("a"), "first").remaining, 1);
+    testing::assert(testing::expect_ok(limiter.check("a"), "second").allowed);
+    let denied = testing::expect_ok(limiter.check("a"), "denied");
+    testing::assert(!denied.allowed);
+    testing::assert_eq(denied.retry_after_seconds, 2);
+    testing::assert(testing::expect_ok(limiter.check("b"), "capacity").capacity_reached);
+    now.set(1499);
+    testing::assert_eq(
+        testing::expect_ok(limiter.check("a"), "just before refill").retry_after_seconds,
+        1,
+    );
+    now.set(1500);
+    testing::assert(testing::expect_ok(limiter.check("a"), "one refilled token").allowed);
+    now.set(0);
+    testing::assert(!testing::expect_ok(limiter.check("a"), "clock regression").allowed);
+    now.set(4500);
+    testing::assert(testing::expect_ok(limiter.check("b"), "idle eviction").allowed);
+    testing::assert_eq(limiter.len(), 1);
+    testing::assert_err(
+        web::RateLimiter::new(
+            web::RateLimitOptions { idle_milliseconds: 1, ..web::RateLimitOptions::new() },
+        ),
+    );
+    let router = web::Router::new().get("/", |_| Result::Ok(web::Response::new(200))).layer(
+        limiter.layer_by(|_| Result::Ok("b")),
+    );
+    testing::assert_eq(security_dispatch(router, "GET", "/", web::Headers::new()).status, 200);
+    let denied = security_dispatch(router, "GET", "/", web::Headers::new());
+    testing::assert_eq(denied.status, 429);
+    testing::assert(denied.headers.get("retry-after") == Option::Some("2"));
+}
+
+#[test]
+fn concurrent_sessions_and_rate_checks_serialize_shared_state() -> () {
+    let store = testing::expect_ok(web::SessionStore::new(web::SessionOptions::new()), "store");
+    let router = web::Router::new().get(
+        "/token",
+        |request| Result::Ok(web::Response::text(200, request.session()?.csrf_token()?)),
+    ).post(
+        "/{key}",
+        |request| {
+            request.session()?.insert(request.params().required("key")?, "value")?;
+            Result::Ok(web::Response::new(204))
+        },
+    ).get(
+        "/{key}",
+        |request| Result::Ok(
+            web::Response::text(
+                200,
+                request.session()?.get(request.params().required("key")?)?.unwrap_or("missing"),
+            ),
+        ),
+    ).layer(store.layer());
+    let cookie = security_cookie(security_dispatch(router, "GET", "/token", web::Headers::new()));
+    let limiter = testing::expect_ok(
+        web::RateLimiter::with_clock(
+            web::RateLimitOptions { burst: 8, ..web::RateLimitOptions::new() },
+            || 0,
+        ),
+        "limiter",
+    );
+    task::scope(
+        |scope| {
+            let tasks = Vec::new();
+            for index in 0..32 {
+                tasks.push(
+                    scope.spawn(
+                        |_| {
+                            testing::assert_eq(
+                                security_dispatch(
+                                    router,
+                                    "POST",
+                                    "/k" + index.to_string(),
+                                    security_headers(cookie, "", ""),
+                                ).status,
+                                204,
+                            );
+                            testing::expect_ok(limiter.check("shared"), "concurrent limit").allowed
+                        },
+                    ),
+                );
+            }
+            let mut accepted = 0;
+            for task in tasks {
+                if task.join() {
+                    accepted += 1;
+                }
+            }
+            testing::assert_eq(accepted, 8);
+        },
+    );
+    for index in 0..32 {
+        testing::assert_eq(
+            testing::expect_ok(
+                security_dispatch(
+                    router,
+                    "GET",
+                    "/k" + index.to_string(),
+                    security_headers(cookie, "", ""),
+                ).text(),
+                "stored field",
+            ),
+            "value",
+        );
+    }
+    testing::assert_eq(store.len(), 1);
+}
+
+#[test]
+fn concurrent_rotation_invalidates_other_open_handles_and_cross_session_tokens() -> () {
+    let store = testing::expect_ok(web::SessionStore::new(web::SessionOptions::new()), "store");
+    let arrived: Channel[()] = Channel::new(2);
+    let release: Channel[()] = Channel::new(0);
+    let router = web::Router::new().get(
+        "/",
+        |request| {
+            request.session()?.insert("user", "alice")?;
+            Result::Ok(web::Response::text(200, request.session()?.csrf_token()?))
+        },
+    ).post(
+        "/rotate",
+        |request| {
+            let session = request.session()?;
+            arrived.send(());
+            let _ = release.recv();
+            match session.rotate() {
+                Ok(_) => Result::Ok(
+                    web::Response::text(200, session.get("user")?.unwrap_or("missing")),
+                ),
+                Err(_) => {
+                    testing::assert_err(session.insert("user", "resurrected"));
+                    Result::Ok(web::Response::new(409))
+                },
+            }
+        },
+    ).layer(store.layer());
+    let cookie = security_cookie(security_dispatch(router, "GET", "/", web::Headers::new()));
+    task::scope(
+        |scope| {
+            let first = scope.spawn(
+                |_| security_dispatch(router, "POST", "/rotate", security_headers(cookie, "", "")),
+            );
+            let second = scope.spawn(
+                |_| security_dispatch(router, "POST", "/rotate", security_headers(cookie, "", "")),
+            );
+            let _ = arrived.recv();
+            let _ = arrived.recv();
+            release.close();
+            let first = first.join();
+            let second = second.join();
+            testing::assert(
+                first.status == 200 && second.status == 409
+                    || first.status == 409 && second.status == 200,
+            );
+            let winner = if first.status == 200 {
+                first
+            } else {
+                second
+            };
+            testing::assert_eq(testing::expect_ok(winner.text(), "preserved session data"), "alice");
+            testing::assert(security_cookie(winner) != cookie);
+        },
+    );
+    testing::assert_eq(store.len(), 1);
+    let router = security_app(store);
+    let first = security_dispatch(router, "GET", "/token", web::Headers::new());
+    let second = security_dispatch(router, "GET", "/token", web::Headers::new());
+    let cookie = security_cookie(first);
+    let other_token = testing::expect_ok(second.text(), "other session token");
+    testing::assert_eq(
+        security_dispatch(
+            router,
+            "POST",
+            "/login",
+            security_headers(cookie, other_token, "https://app.example"),
+        ).status,
+        403,
+    );
+}
