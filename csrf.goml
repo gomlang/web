@@ -1,0 +1,87 @@
+package web;
+
+use std::crypto;
+use std::net::url;
+
+pub struct Csrf {
+    origins: Vec[string],
+    header: string,
+}
+
+impl Csrf {
+    pub fn new(origins: Vec[string]) -> Csrf {
+        Csrf { origins: origins.copy(), header: "x-csrf-token" }
+    }
+
+    pub fn with_header(self: Csrf, header: string) -> Csrf {
+        Csrf { header, ..self }
+    }
+
+    pub fn layer(self: Csrf) -> Result[Middleware, Error] {
+        if self.origins.is_empty() || self.origins.len() > 128 || !token(self.header)
+            || self.header.byte_len() > 128 {
+            return Err(
+                Error::new(
+                    ErrorKind::Configuration,
+                    "CSRF needs explicit origins and a valid token header",
+                ),
+            )
+        }
+        for origin in self.origins {
+            let parsed = url::Reference::parse(origin, 2048).map_err(
+                |_| Error::new(ErrorKind::Configuration, "invalid CSRF origin"),
+            )?;
+            let authority = parsed.authority().map_err(
+                |_| Error::new(ErrorKind::Configuration, "invalid CSRF origin"),
+            )?.ok_or(Error::new(ErrorKind::Configuration, "invalid CSRF origin"))?;
+            if !(parsed.scheme() == Option::Some("https") || parsed.scheme() == Option::Some("http"))
+                || parsed.raw_path() != ""
+                || parsed.raw_query().is_some()
+                || parsed.raw_fragment().is_some()
+                || authority.raw_host() == ""
+                || authority.userinfo().is_some()
+                || authority.raw_zone().is_some()
+                || origin.contains("*")
+                || origin.contains(" ") {
+                return Err(
+                    Error::new(
+                        ErrorKind::Configuration,
+                        "CSRF origin must be an explicit HTTP origin without a path",
+                    ),
+                )
+            }
+        }
+        Ok(
+            |request, next| {
+                if request.method() == "GET" || request.method() == "HEAD"
+                    || request.method() == "OPTIONS" {
+                    return next.run(request)
+                }
+                let origins = request.headers().get_all("origin");
+                let supplied = request.headers().get_all(self.header);
+                if origins.len() != 1 || !self.origins.contains(origins[0]) || supplied.len() != 1
+                    || !valid_secret(supplied[0]) {
+                    return Ok(
+                        Response::text(403, "CSRF verification failed").header(
+                            "cache-control",
+                            "no-store",
+                        ),
+                    )
+                }
+                let expected = request.session()?.csrf_token()?;
+                if !crypto::digest_equal(
+                    expected.to_bytes().as_slice(),
+                    supplied[0].to_bytes().as_slice(),
+                ) {
+                    return Ok(
+                        Response::text(403, "CSRF verification failed").header(
+                            "cache-control",
+                            "no-store",
+                        ),
+                    )
+                }
+                next.run(request)
+            },
+        )
+    }
+}

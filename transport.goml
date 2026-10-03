@@ -407,6 +407,7 @@ fn make_request(head: Head, body: BodyState, lifetime: Lifetime, remote: string,
         headers_value: head.headers,
         params_value: Pairs::new(),
         attributes: Pairs::new(),
+        session_value: Option::None,
         extraction_limit: limits.extraction_bytes,
         field_limit: limits.form_fields,
     }

@@ -168,6 +168,7 @@ pub struct Request {
     headers_value: Headers,
     params_value: Pairs,
     attributes: Pairs,
+    session_value: Option[Session],
     extraction_limit: isize,
     field_limit: isize,
 }

@@ -1,0 +1,182 @@
+package web;
+
+use std::net::{SocketAddr};
+use std::time::{Instant};
+
+pub struct RateLimitOptions {
+    pub burst: isize,
+    pub refill_milliseconds: i64,
+    pub idle_milliseconds: i64,
+    pub max_keys: isize,
+    pub max_key_bytes: isize,
+}
+
+impl RateLimitOptions {
+    pub fn new() -> RateLimitOptions {
+        RateLimitOptions {
+            burst: 60,
+            refill_milliseconds: 1000,
+            idle_milliseconds: 60000,
+            max_keys: 4096,
+            max_key_bytes: 256,
+        }
+    }
+}
+
+struct RateBucket {
+    tokens: isize,
+    refilled: i64,
+    touched: i64,
+}
+
+pub struct RateDecision {
+    pub allowed: bool,
+    pub remaining: isize,
+    pub retry_after_seconds: i64,
+    pub capacity_reached: bool,
+}
+
+pub struct RateLimiter {
+    gate: Channel[()],
+    buckets: HashMap[string, RateBucket],
+    clock: () -> i64,
+    last_now: Ref[i64],
+    options: RateLimitOptions,
+}
+
+impl RateLimiter {
+    pub fn new(options: RateLimitOptions) -> Result[RateLimiter, Error] {
+        let start = Instant::now();
+        RateLimiter::with_clock(options, || start.elapsed().as_milliseconds())
+    }
+
+    pub fn with_clock(options: RateLimitOptions, clock: () -> i64) -> Result[RateLimiter, Error] {
+        if options.burst < 1 || options.burst > 1000000 || options.refill_milliseconds < 1
+            || options.refill_milliseconds > 86400000
+            || options.idle_milliseconds < options.refill_milliseconds * options.burst.to_i64()
+            || options.max_keys < 1
+            || options.max_keys > 65536
+            || options.max_key_bytes < 1
+            || options.max_key_bytes > 4096 {
+            return Err(Error::new(ErrorKind::Configuration, "invalid rate limiter limits"))
+        }
+        Ok(
+            RateLimiter {
+                gate: gate(),
+                buckets: HashMap::new(),
+                clock,
+                last_now: Ref::new(0),
+                options,
+            },
+        )
+    }
+
+    pub fn check(self: RateLimiter, key: string) -> Result[RateDecision, Error] {
+        if key == "" || key.byte_len() > self.options.max_key_bytes {
+            return Err(bad_request("invalid rate limiter key"))
+        }
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        let observed = (self.clock)();
+        if observed > self.last_now.get() {
+            self.last_now.set(observed);
+        }
+        let now = self.last_now.get();
+        let mut bucket = match self.buckets.get(key) {
+            Some(bucket) => bucket,
+            None => {
+                if self.buckets.len() >= self.options.max_keys {
+                    for (stored_key, bucket) in self.buckets.entries() {
+                        if now - bucket.touched >= self.options.idle_milliseconds {
+                            self.buckets.remove(stored_key);
+                        }
+                    }
+                }
+                if self.buckets.len() >= self.options.max_keys {
+                    return Ok(
+                        RateDecision {
+                            allowed: false,
+                            remaining: 0,
+                            retry_after_seconds: 1,
+                            capacity_reached: true,
+                        },
+                    )
+                }
+                RateBucket { tokens: self.options.burst, refilled: now, touched: now }
+            },
+        };
+        let elapsed = now - bucket.refilled;
+        let added = elapsed / self.options.refill_milliseconds;
+        if added >= (self.options.burst - bucket.tokens).to_i64() {
+            bucket.tokens = self.options.burst;
+            bucket.refilled = now;
+        } else if added > 0 {
+            bucket.tokens += added.to_isize();
+            bucket.refilled = now - elapsed % self.options.refill_milliseconds;
+        }
+        let allowed = bucket.tokens > 0;
+        if allowed {
+            bucket.tokens -= 1;
+        }
+        bucket.touched = now;
+        self.buckets.insert(key, bucket);
+        let retry = if allowed {
+            0
+        } else {
+            (self.options.refill_milliseconds - (now - bucket.refilled) + 999) / 1000
+        };
+        Ok(
+            RateDecision {
+                allowed,
+                remaining: bucket.tokens,
+                retry_after_seconds: retry,
+                capacity_reached: false,
+            },
+        )
+    }
+
+    pub fn len(self: RateLimiter) -> isize {
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        self.buckets.len()
+    }
+
+    pub fn layer(self: RateLimiter) -> Middleware {
+        self.layer_by(
+            |request| {
+                let address = request.remote_address()?;
+                let socket = SocketAddr::parse(address).map_err(
+                    |_| Error::new(
+                        ErrorKind::Configuration,
+                        "rate limiting requires a socket peer or an explicit key function",
+                    ),
+                )?;
+                Ok(socket.ip.to_string())
+            },
+        )
+    }
+
+    pub fn layer_by(self: RateLimiter, key: (Request) -> Result[string, Error]) -> Middleware {
+        |request, next| {
+            request.check()?;
+            let decision = self.check(key(request)?)?;
+            request.check()?;
+            if !decision.allowed {
+                return Ok(
+                    Response::text(
+                        if decision.capacity_reached {
+                            503
+                        } else {
+                            429
+                        },
+                        "rate limit reached",
+                    ).header("retry-after", decision.retry_after_seconds.to_string()).header(
+                        "cache-control",
+                        "no-store",
+                    ),
+                )
+            }
+            next.run(request)
+        }
+    }
+}

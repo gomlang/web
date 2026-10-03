@@ -115,6 +115,130 @@ existing Linux file-descriptor API.
 
 `compression(max_bytes)` negotiates gzip and identity using `Accept-Encoding` quality values. It compresses buffered responses within the bound, preserves `Vary`, weakens representation ETags, and removes obsolete content digests. Existing encodings, range responses, upgrades, streams/SSE and `Cache-Control: no-transform` remain outside compression. If no available representation is acceptable it returns 406. Streaming responses retain their existing bounded transport behavior.
 
+## Sessions, CSRF and rate limiting
+
+These facilities are opt-in router layers. Session and limiter state is shared
+by copies of the same store and serialized internally. They use GoML code and
+`std::crypto::rand` operating-system entropy, without additional dependencies.
+
+```goml
+use ecosystem::web::{Router, Response, SessionStore, SessionOptions, Csrf};
+use ecosystem::web::{RateLimiter, RateLimitOptions};
+
+let sessions = SessionStore::new(SessionOptions::new())?;
+let limiter = RateLimiter::new(RateLimitOptions::new())?;
+let router = Router::new()
+    .get("/csrf", |request| {
+        Result::Ok(Response::text(200, request.session()?.csrf_token()?))
+    })
+    .post("/preference", |request| {
+        request.session()?.insert("theme", request.text()?)?;
+        Result::Ok(Response::new(204))
+    })
+    .layer(limiter.layer())
+    .layer(sessions.layer())
+    .layer(Csrf::new(Vec::from_array(["https://app.example"])).layer()?);
+```
+
+Layers run in registration order: rate limiting first prevents rejected traffic
+from allocating sessions; sessions must precede CSRF. Serve this configuration
+through HTTPS. Fetch the token response using the session cookie, then send it
+in `X-CSRF-Token` with the browser's `Origin` on every state-changing request.
+Tokens belong in response bodies and request headers, never URLs or logs.
+
+### Session lifecycle and bounds
+
+`Request::session()` exposes `get`, `insert`, `remove`, `csrf_token`, `rotate`
+and `logout`. Values are strings stored only on the server. IDs and CSRF tokens
+are independently generated 256-bit random values encoded as lowercase hex.
+The cookie carries only the opaque session ID. Unknown, malformed, expired or
+revoked IDs receive a fresh anonymous session with a newly generated ID;
+client-supplied IDs are never adopted. Duplicate named cookies and whitespace
+before the named cookie's `=` return 400.
+This follows the strict session lifecycle described in the
+[OWASP session guidance](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html).
+
+After successfully authenticating credentials or changing privileges, call
+`rotate()` before saving the new authentication state. Rotation preserves data
+and the absolute expiry, changes both ID and CSRF token, and immediately
+invalidates the old ID. Previously opened handles for the old ID cannot restore
+it. `logout()` removes server state and expires the cookie. `SessionStore::clear`
+revokes every stored session. Neither method supplies authentication or
+application authorization; handlers must implement those checks.
+
+`SessionOptions::new()` limits the store to 4096 sessions, 64 fields and 16384
+combined key/value bytes per session. Idle timeout is 1800 seconds and absolute
+lifetime is 86400 seconds; accepted requests refresh only the idle timestamp.
+The store never evicts active sessions to admit new ones: exhausted capacity
+returns 503. Expiration is checked on access; a capacity-pressure scan and
+`len()` also reclaim expired records. There is no background cleanup task.
+Fields exceeding configured bounds return `BodyLimit` without changing data.
+Individual operations are synchronized; a separate `get` followed by `insert`
+is not an atomic read-modify-write transaction.
+
+The default cookie is `__Host-goml_session`, `Secure`, `HttpOnly`, `Path=/`,
+`SameSite=Lax`, with no Domain and a Max-Age equal to the remaining absolute
+lifetime rounded up to seconds. Server-side expiry remains exact even during
+that final fraction of a second. `SessionCookie` builders configure name, path, domain, Secure and
+`SameSite::{Strict,Lax,None}`. Prefix invariants are validated and SameSite=None
+requires Secure; HttpOnly is always set. Local HTTP development requires both
+an ordinary cookie name and explicit `with_secure(false)`. Domain sharing
+expands trust to sibling hosts, so retain the default host-only policy when
+possible. Session responses use `Cache-Control: no-store`.
+
+Make session changes before the handler returns. Handles are sealed before
+response streaming and become unusable after a response, so a stream producer
+cannot rotate a cookie after headers have been decided. A handler error or
+panic can leave a newly allocated session without a delivered cookie until
+expiry, within the fixed capacity. Records and tokens live in process memory;
+there is no persistent/distributed backend or cross-process revocation.
+
+### CSRF policy
+
+`Csrf::new(origins).layer()` implements a
+[synchronizer token](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html#synchronizer-token-pattern)
+check using the session token. Only GET, HEAD and OPTIONS bypass the check;
+these handlers must avoid state-changing application actions. Every other
+method requires exactly one Origin matching an explicitly configured HTTP(S)
+origin and exactly one valid token header. Missing Origin, `null`, wildcards,
+duplicate headers and token mismatches fail with 403. Origin comparisons are
+exact; configure the browser's serialized origin, without a trailing slash,
+credentials, query or fragment. Host, Referer and forwarding headers never
+establish trust. `with_header` changes the token header name.
+
+Verification compares all 64 bytes for equal-length tokens using
+`std::crypto::digest_equal`; GoML does not promise compiler-enforced constant
+time. There is no form-body token extraction, Referer fallback, Fetch Metadata
+policy or automatic CORS registration. Credentialed cross-origin frontends
+must configure the separate CORS layer consistently. Session rotation requires
+clients to fetch or receive the new token.
+
+### Token bucket policy
+
+`RateLimitOptions::new()` permits a burst of 60 requests per key and replenishes
+one token each 1000 milliseconds. It retains at most 4096 keys, each at most
+256 bytes; idle records are eligible for removal after 60000 milliseconds.
+`idle_milliseconds` must be at least `burst * refill_milliseconds`, ensuring
+that eviction cannot restore tokens sooner than a full refill. At capacity,
+unexpired keys are retained and new keys receive 503; an exhausted existing
+bucket receives 429. Both include a positive, rounded-up `Retry-After` value
+(the capacity response uses one second as a retry hint).
+
+`layer()` groups requests by the actual socket peer IP, excluding the ephemeral
+port, and ignores `Forwarded` and `X-Forwarded-For`. `layer_by` supplies a custom
+request-to-key function; use it after verified identity middleware for account
+limits, or with an explicitly authenticated proxy policy. For dispatch tests
+without a socket peer, use `layer_by`. `check(key)` exposes the same atomic
+bucket decision without HTTP, including remaining tokens and capacity status.
+`len()` reports allocated buckets, including idle buckets until a later
+capacity-pressure scan.
+
+Both stores offer `with_clock(options, () -> i64)` for deterministic millisecond
+clocks; defaults use elapsed monotonic time. Regressions clamp to the last
+observed value. Clock callbacks run under the store lock and must be fast and
+must not reenter that store. These are per-process limits, not distributed
+quotas or a replacement for ingress connection/body limits.
+
 ## Limits, deadlines and shutdown
 
 `Limits::new` sets a 1 MiB request body limit, 1 MiB extraction limit, 1024 query/form fields, 4 MiB captured response limit, 30-second total request timeout, 5-second header timeout, 32 KiB header limit and 256 concurrent requests. `header_bytes` is an exact bound including the request line, CRLF delimiters and final empty line; trailers have a separate bound of the same size. Both known-length and chunked bodies are checked. Ambiguous Content-Length/Transfer-Encoding framing, duplicate framing headers, invalid header names and control-byte injection are rejected. Concurrent admission rejects excess requests with 503 without building an unbounded wait queue. Idle keepalive connections do not occupy request slots; accepted connections have a separate cap of `concurrent_requests + 256`. Idle connections expire after 60 seconds.

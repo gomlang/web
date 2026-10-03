@@ -1,0 +1,471 @@
+package web;
+
+use std::crypto::rand;
+use std::encoding::hex;
+use std::time::{Instant};
+
+#[derive(PartialEq)]
+pub enum SameSite {
+    Strict,
+    Lax,
+    None,
+}
+
+pub struct SessionCookie {
+    name: string,
+    path: string,
+    domain: Option[string],
+    secure: bool,
+    same_site: SameSite,
+}
+
+impl SessionCookie {
+    pub fn new() -> SessionCookie {
+        SessionCookie {
+            name: "__Host-goml_session",
+            path: "/",
+            domain: Option::None,
+            secure: true,
+            same_site: SameSite::Lax,
+        }
+    }
+
+    pub fn with_name(self: SessionCookie, name: string) -> SessionCookie {
+        SessionCookie { name, ..self }
+    }
+
+    pub fn with_path(self: SessionCookie, path: string) -> SessionCookie {
+        SessionCookie { path, ..self }
+    }
+
+    pub fn with_domain(self: SessionCookie, domain: string) -> SessionCookie {
+        SessionCookie { domain: Option::Some(domain), ..self }
+    }
+
+    pub fn with_secure(self: SessionCookie, secure: bool) -> SessionCookie {
+        SessionCookie { secure, ..self }
+    }
+
+    pub fn with_same_site(self: SessionCookie, same_site: SameSite) -> SessionCookie {
+        SessionCookie { same_site, ..self }
+    }
+
+    fn validate(self: SessionCookie) -> Result[(), Error] {
+        if !token(self.name) || self.name.byte_len() > 128 || !self.path.starts_with("/")
+            || self.path.byte_len() > 1024 {
+            return Err(Error::new(ErrorKind::Configuration, "invalid session cookie name or path"))
+        }
+        for byte in self.path.to_bytes() {
+            if byte < 33 || byte > 126 || byte == b';' || byte == b',' || byte == b'\\' {
+                return Err(Error::new(ErrorKind::Configuration, "invalid session cookie path"))
+            }
+        }
+        if let Option::Some(domain) = self.domain {
+            if domain.byte_len() == 0 || domain.byte_len() > 253 {
+                return Err(Error::new(ErrorKind::Configuration, "invalid session cookie domain"))
+            }
+            for byte in domain.to_bytes() {
+                if !(byte >= b'a' && byte <= b'z' || byte >= b'A' && byte <= b'Z'
+                    || byte >= b'0' && byte <= b'9'
+                    || byte == b'-'
+                    || byte == b'.') {
+                    return Err(
+                        Error::new(ErrorKind::Configuration, "invalid session cookie domain"),
+                    )
+                }
+            }
+        }
+        if self.name.starts_with("__Host-")
+            && (!self.secure || self.domain.is_some() || self.path != "/")
+            || self.name.starts_with("__Secure-") && !self.secure
+            || self.same_site == SameSite::None && !self.secure {
+            return Err(
+                Error::new(
+                    ErrorKind::Configuration,
+                    "session cookie security policy is inconsistent",
+                ),
+            )
+        }
+        Ok(())
+    }
+
+    fn render(self: SessionCookie, id: string, seconds: i64) -> string {
+        let mut value = self.name + "=" + id + "; Path=" + self.path + "; Max-Age="
+            + seconds.to_string()
+            + "; HttpOnly; SameSite="
+            + match self.same_site {
+                SameSite::Strict => "Strict",
+                SameSite::Lax => "Lax",
+                SameSite::None => "None",
+            };
+        if self.secure {
+            value += "; Secure";
+        }
+        if let Option::Some(domain) = self.domain {
+            value += "; Domain=" + domain;
+        }
+        value
+    }
+}
+
+pub struct SessionOptions {
+    pub capacity: isize,
+    pub idle_seconds: i64,
+    pub lifetime_seconds: i64,
+    pub max_fields: isize,
+    pub max_data_bytes: isize,
+    pub cookie: SessionCookie,
+}
+
+impl SessionOptions {
+    pub fn new() -> SessionOptions {
+        SessionOptions {
+            capacity: 4096,
+            idle_seconds: 1800,
+            lifetime_seconds: 86400,
+            max_fields: 64,
+            max_data_bytes: 16384,
+            cookie: SessionCookie::new(),
+        }
+    }
+}
+
+struct SessionRecord {
+    created: i64,
+    touched: i64,
+    csrf: string,
+    values: Pairs,
+}
+
+struct SessionCursor {
+    id: string,
+    changed: bool,
+    logged_out: bool,
+    sealed: bool,
+}
+
+pub struct SessionStore {
+    gate: Channel[()],
+    records: HashMap[string, SessionRecord],
+    clock: () -> i64,
+    last_now: Ref[i64],
+    options: SessionOptions,
+}
+
+pub struct Session {
+    store: SessionStore,
+    cursor: Ref[SessionCursor],
+    lifetime: Lifetime,
+}
+
+fn secret_token() -> Result[string, Error] {
+    rand::bytes(32).map(|bytes| hex::encode(bytes)).map_err(
+        |_| Error::new(ErrorKind::Internal, "session entropy unavailable"),
+    )
+}
+
+fn valid_secret(value: string) -> bool {
+    if value.byte_len() != 64 {
+        return false
+    }
+    for byte in value.to_bytes() {
+        if !(byte >= b'0' && byte <= b'9' || byte >= b'a' && byte <= b'f') {
+            return false
+        }
+    }
+    true
+}
+
+fn session_cookie(headers: Headers, name: string) -> Result[Option[string], Error] {
+    let mut found: Option[string] = Option::None;
+    for header in headers.get_all("cookie") {
+        for part in header.split(";") {
+            let (key, value) = part.trim().split_once("=").unwrap_or((part.trim(), ""));
+            if key.trim() == name {
+                if key != name {
+                    return Err(bad_request("invalid session cookie whitespace"))
+                }
+                if found.is_some() {
+                    return Err(bad_request("duplicate session cookie"))
+                }
+                found = Option::Some(value);
+            }
+        }
+    }
+    Ok(found)
+}
+
+impl SessionStore {
+    pub fn new(options: SessionOptions) -> Result[SessionStore, Error] {
+        let start = Instant::now();
+        SessionStore::with_clock(options, || start.elapsed().as_milliseconds())
+    }
+
+    pub fn with_clock(options: SessionOptions, clock: () -> i64) -> Result[SessionStore, Error] {
+        options.cookie.validate()?;
+        if options.capacity < 1 || options.capacity > 65536 || options.idle_seconds < 1
+            || options.lifetime_seconds < 1
+            || options.idle_seconds > options.lifetime_seconds
+            || options.lifetime_seconds > 31536000
+            || options.max_fields < 1
+            || options.max_fields > 1024
+            || options.max_data_bytes < 1
+            || options.max_data_bytes > 1048576 {
+            return Err(Error::new(ErrorKind::Configuration, "invalid session store limits"))
+        }
+        Ok(
+            SessionStore {
+                gate: gate(),
+                records: HashMap::new(),
+                clock,
+                last_now: Ref::new(0),
+                options,
+            },
+        )
+    }
+
+    fn now(self: SessionStore) -> i64 {
+        let value = (self.clock)();
+        if value > self.last_now.get() {
+            self.last_now.set(value);
+        }
+        self.last_now.get()
+    }
+
+    fn expired(self: SessionStore, record: SessionRecord, now: i64) -> bool {
+        now - record.created >= self.options.lifetime_seconds * 1000
+            || now - record.touched >= self.options.idle_seconds * 1000
+    }
+
+    fn purge(self: SessionStore, now: i64) -> () {
+        for (id, record) in self.records.entries() {
+            if self.expired(record, now) {
+                self.records.remove(id);
+            }
+        }
+    }
+
+    pub fn len(self: SessionStore) -> isize {
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        self.purge(self.now());
+        self.records.len()
+    }
+
+    pub fn clear(self: SessionStore) -> () {
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        for (id, _) in self.records.entries() {
+            self.records.remove(id);
+        }
+    }
+
+    fn open(self: SessionStore, request: Request) -> Result[Option[Session], Error] {
+        let supplied = session_cookie(request.headers(), self.options.cookie.name)?;
+        request.lifetime.acquire(self.gate)?;
+        defer self.gate.send(());
+        let now = self.now();
+        let mut id = supplied.unwrap_or("");
+        if let Option::Some(record) = self.records.get(id) {
+            if self.expired(record, now) {
+                self.records.remove(id);
+            }
+        }
+        let mut changed = false;
+        if !valid_secret(id) || self.records.get(id).is_none() {
+            if self.records.len() >= self.options.capacity {
+                self.purge(now);
+            }
+            if self.records.len() >= self.options.capacity {
+                return Ok(Option::None)
+            }
+            id = secret_token()?;
+            if self.records.get(id).is_some() {
+                return Err(Error::new(ErrorKind::Internal, "session identifier collision"))
+            }
+            self.records.insert(
+                id,
+                SessionRecord {
+                    created: now,
+                    touched: now,
+                    csrf: secret_token()?,
+                    values: Pairs::new(),
+                },
+            );
+            changed = true;
+        } else if let Option::Some(record) = self.records.get(id) {
+            self.records.insert(id, SessionRecord { touched: now, ..record });
+        }
+        Ok(
+            Option::Some(
+                Session {
+                    store: self,
+                    cursor: Ref::new(
+                        SessionCursor { id, changed, logged_out: false, sealed: false },
+                    ),
+                    lifetime: request.lifetime,
+                },
+            ),
+        )
+    }
+
+    pub fn layer(self: SessionStore) -> Middleware {
+        |request, next| {
+            if request.session_value.is_some() {
+                return Err(
+                    Error::new(ErrorKind::Configuration, "session middleware registered twice"),
+                )
+            }
+            let session = match self.open(request)? {
+                Option::Some(session) => session,
+                None => return Ok(
+                    Response::text(503, "session capacity reached").header(
+                        "cache-control",
+                        "no-store",
+                    ),
+                ),
+            };
+            defer session.seal();
+            let response = next.run(Request { session_value: Option::Some(session), ..request })?;
+            session.response(response)
+        }
+    }
+}
+
+impl Session {
+    fn record(self: Session) -> Result[SessionRecord, Error] {
+        self.lifetime.check()?;
+        let cursor = self.cursor.get();
+        if cursor.logged_out || cursor.sealed {
+            return Err(closed_error())
+        }
+        let record = self.store.records.get(cursor.id).ok_or(closed_error())?;
+        if self.store.expired(record, self.store.now()) {
+            self.store.records.remove(cursor.id);
+            return Err(closed_error())
+        }
+        Ok(record)
+    }
+
+    fn seal(self: Session) -> () {
+        let _ = self.store.gate.recv();
+        defer self.store.gate.send(());
+        self.cursor.set(SessionCursor { sealed: true, ..self.cursor.get() });
+    }
+
+    fn response(self: Session, response: Response) -> Result[Response, Error] {
+        self.lifetime.acquire(self.store.gate)?;
+        defer self.store.gate.send(());
+        let cursor = self.cursor.get();
+        self.cursor.set(SessionCursor { sealed: true, ..cursor });
+        let response = response.header("cache-control", "no-store");
+        if cursor.logged_out {
+            return Ok(response.append_header("set-cookie", self.store.options.cookie.render("", 0)))
+        }
+        if cursor.changed {
+            let record = self.store.records.get(cursor.id).ok_or(closed_error())?;
+            let remaining = self.store.options.lifetime_seconds
+                - (self.store.now() - record.created) / 1000;
+            if remaining <= 0 || self.store.expired(record, self.store.now()) {
+                return Err(closed_error())
+            }
+            return Ok(
+                response.append_header(
+                    "set-cookie",
+                    self.store.options.cookie.render(cursor.id, remaining),
+                ),
+            )
+        }
+        Ok(response)
+    }
+
+    pub fn get(self: Session, key: string) -> Result[Option[string], Error] {
+        self.lifetime.acquire(self.store.gate)?;
+        defer self.store.gate.send(());
+        Ok(self.record()?.values.get(key))
+    }
+
+    pub fn insert(self: Session, key: string, value: string) -> Result[(), Error] {
+        self.lifetime.acquire(self.store.gate)?;
+        defer self.store.gate.send(());
+        let record = self.record()?;
+        if key.byte_len() == 0 || key.byte_len() > self.store.options.max_data_bytes
+            || value.byte_len() > self.store.options.max_data_bytes {
+            return Err(Error::new(ErrorKind::BodyLimit, "session field exceeds limit"))
+        }
+        let values = Vec::new();
+        let mut length = key.byte_len() + value.byte_len();
+        for pair in record.values.values {
+            if pair.0 != key {
+                length += pair.0.byte_len() + pair.1.byte_len();
+                values.push(pair);
+            }
+        }
+        if values.len() >= self.store.options.max_fields
+            || length > self.store.options.max_data_bytes {
+            return Err(Error::new(ErrorKind::BodyLimit, "session data exceeds limit"))
+        }
+        values.push((key, value));
+        self.store.records.insert(
+            self.cursor.get().id,
+            SessionRecord { values: Pairs { values }, ..record },
+        );
+        Ok(())
+    }
+
+    pub fn remove(self: Session, key: string) -> Result[(), Error] {
+        self.lifetime.acquire(self.store.gate)?;
+        defer self.store.gate.send(());
+        let record = self.record()?;
+        let values = Vec::new();
+        for pair in record.values.values {
+            if pair.0 != key {
+                values.push(pair);
+            }
+        }
+        self.store.records.insert(
+            self.cursor.get().id,
+            SessionRecord { values: Pairs { values }, ..record },
+        );
+        Ok(())
+    }
+
+    pub fn csrf_token(self: Session) -> Result[string, Error] {
+        self.lifetime.acquire(self.store.gate)?;
+        defer self.store.gate.send(());
+        Ok(self.record()?.csrf)
+    }
+
+    pub fn rotate(self: Session) -> Result[(), Error] {
+        self.lifetime.acquire(self.store.gate)?;
+        defer self.store.gate.send(());
+        let record = self.record()?;
+        let id = secret_token()?;
+        let csrf = secret_token()?;
+        if self.store.records.get(id).is_some() {
+            return Err(Error::new(ErrorKind::Internal, "session identifier collision"))
+        }
+        self.store.records.remove(self.cursor.get().id);
+        self.store.records.insert(id, SessionRecord { csrf, ..record });
+        self.cursor.set(SessionCursor { id, changed: true, ..self.cursor.get() });
+        Ok(())
+    }
+
+    pub fn logout(self: Session) -> Result[(), Error] {
+        self.lifetime.acquire(self.store.gate)?;
+        defer self.store.gate.send(());
+        self.record()?;
+        self.store.records.remove(self.cursor.get().id);
+        self.cursor.set(SessionCursor { logged_out: true, changed: true, ..self.cursor.get() });
+        Ok(())
+    }
+}
+
+impl Request {
+    pub fn session(self: Request) -> Result[Session, Error] {
+        self.check()?;
+        self.session_value.ok_or(
+            Error::new(ErrorKind::Configuration, "session middleware is required"),
+        )
+    }
+}
