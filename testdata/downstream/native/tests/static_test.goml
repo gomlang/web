@@ -6,6 +6,64 @@ use std::testing;
 use std::time::{Duration};
 
 #[test]
+fn static_compression_revalidation_preserves_negotiated_metadata() -> () {
+    let root = "_artifact/static-compression-http";
+    testing::assert_ok(fs::create_dir_all(root));
+    testing::assert_ok(fs::write_file_structured(root + "/file.txt", "0123456789"));
+    let files = testing::expect_ok(web::StaticFiles::new(root, 100), "static files");
+    defer {
+        let _ = files.close();
+    };
+    let server = transport_server(
+        web::Router::new().get("/{*path}", files.handler("path")).layer(
+            testing::expect_ok(web::compression(1024), "compression"),
+        ),
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    let head = transport_request(
+        server,
+        "HEAD /file.txt HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(head.starts_with("HTTP/1.1 200 "));
+    let mut etag = "";
+    for line in head.split("\r\n") {
+        if let Some((name, value)) = line.split_once(":") {
+            if name.eq_ignore_ascii_case("etag") {
+                etag = value.trim();
+            }
+        }
+    }
+    testing::assert(etag.starts_with("W/\""));
+    let cached = transport_request(
+        server,
+        "GET /file.txt HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\nIf-None-Match: "
+            + etag + "\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(cached.starts_with("HTTP/1.1 304 "));
+    testing::assert(cached.contains("etag: " + etag + "\r\n"));
+    testing::assert(cached.contains("content-encoding: gzip\r\n"));
+    testing::assert(!cached.contains("content-length:"));
+    testing::assert(cached.ends_with("\r\n\r\n"));
+    let partial = transport_request(
+        server,
+        "GET /file.txt HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\nRange: bytes=2-4\r\nIf-Range: "
+            + etag.byte_slice(2, etag.byte_len()) + "\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(partial.starts_with("HTTP/1.1 206 "));
+    testing::assert(partial.contains("content-range: bytes 2-4/10\r\n"));
+    testing::assert(!partial.contains("content-encoding:"));
+    testing::assert(partial.ends_with("\r\n\r\n234"));
+    let rejected = transport_request(
+        server,
+        "GET /file.txt HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: *;q=0\r\nIf-None-Match: "
+            + etag + "\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(rejected.starts_with("HTTP/1.1 406 "));
+}
+
+#[test]
 fn static_preconditions_and_head_ranges_work_over_http() -> () {
     let root = "_artifact/static-preconditions-http";
     testing::assert_ok(fs::create_dir_all(root));

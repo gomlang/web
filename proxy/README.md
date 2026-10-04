@@ -23,6 +23,14 @@ incoming bodies return 413; upstream transport or response-limit failures
 return 502, and upstream timeouts return 504. The incoming request context
 cancels the outbound exchange on disconnect or deadline.
 
+After hop-by-hop headers are removed, the proxy forwards `Accept-Encoding`
+values unchanged, including empty and repeated fields. If no value remains,
+it explicitly requests `identity`. These choices override any `Accept-Encoding`
+defaults on the supplied client and disable its automatic gzip decoding, so
+forwarded bodies retain their upstream content encoding and matching 200/304
+metadata. This is the proxy's policy for an absent field; HTTP itself permits
+any content coding when `Accept-Encoding` is absent.
+
 Hop-by-hop headers, including names nominated by `Connection`, are removed on
 both legs. Empty members in Connection lists are ignored; nonempty members
 still require valid tokens. The proxy does not forward an incoming `Forwarded` or

@@ -106,56 +106,86 @@ pub fn compression(max_bytes: isize) -> Result[Middleware, Error] {
     Result::Ok(
         |request: Request, next: Next| {
             let (gzip_quality, identity_quality) = accepted_encodings(request.headers())?;
-            let response = next.run(request)?;
-            if response.status() < 200 {
-                return Result::Ok(response)
-            }
-            if response.headers().get("content-encoding").is_some() {
-                return Result::Ok(response)
-            }
-            let response = vary_header(response, "Accept-Encoding");
-            let forbids_content = response.status() == 204 || response.status() == 205
-                || response.status() == 304;
-            let eligible = !forbids_content && response.status() != 206
-                && response.stream_value.is_none()
-                && response.bytes_value.len() <= max_bytes
-                && !no_transform(response.headers())
-                && !no_transform(request.headers())
-                && response.headers().get("content-range").is_none();
-            if !eligible || gzip_quality == 0 || gzip_quality < identity_quality {
-                return Result::Ok(
-                    if identity_quality == 0 && !forbids_content {
-                        vary_header(
-                            Response::text(406, "no acceptable content encoding"),
-                            "Accept-Encoding",
-                        )
-                    } else {
-                        response
-                    },
-                )
-            }
-            let limits = compress::Limits {
-                max_input_bytes: max_bytes,
-                max_output_bytes: max_bytes + max_bytes / 100 + 1024,
-                max_blocks: max_bytes / 32768 + 16,
-                max_work: max_bytes * 1024 + 65536,
-            };
-            let encoded = gzip::encode(response.bytes_value, limits, 1).map_err(
-                |error| Error::new(ErrorKind::Internal, error.to_string()),
+            // StaticFiles keeps its complete representation until the outermost
+            // compression layer has negotiated its encoding and validator.
+            let response = next.run(Request { defer_static_conditions: true, ..request })?;
+            let response = compress_response(
+                request,
+                response,
+                max_bytes,
+                gzip_quality,
+                identity_quality,
             )?;
-            let mut response = response.body(encoded).header("content-encoding", "gzip");
-            response = Response {
-                headers_value: response.headers().remove("content-md5").remove("digest").remove(
-                    "content-digest",
-                ).remove("repr-digest"),
-                ..response,
-            };
-            if let Some(etag) = response.headers().get("etag") {
-                if !etag.starts_with("W/") {
-                    response = response.header("etag", "W/" + etag);
-                }
-            }
-            Result::Ok(response)
+            Result::Ok(
+                if request.defer_static_conditions {
+                    response
+                } else {
+                    finish_static_conditions(response)
+                },
+            )
         },
     )
+}
+
+fn compress_response(
+    request: Request,
+    response: Response,
+    max_bytes: isize,
+    gzip_quality: isize,
+    identity_quality: isize,
+) -> Result[Response, Error] {
+    if response.status() < 200 {
+        return Result::Ok(response)
+    }
+    if response.headers().get("content-encoding").is_some() {
+        return Result::Ok(response)
+    }
+    let response = vary_header(response, "Accept-Encoding");
+    let forbids_content = response.status() == 204 || response.status() == 205
+        || response.status() == 304;
+    // Preserve identity byte ranges. An unusable If-Range instead selects the
+    // full response, which remains eligible for gzip.
+    let eligible = !forbids_content && response.status() != 206
+        && !response.static_conditions.map(|conditions| static_range_applies(conditions, response)).unwrap_or(
+            false,
+        )
+        && response.stream_value.is_none()
+        && response.bytes_value.len() <= max_bytes
+        && !no_transform(response.headers())
+        && !no_transform(request.headers())
+        && response.headers().get("content-range").is_none();
+    if !eligible || gzip_quality == 0 || gzip_quality < identity_quality {
+        return Result::Ok(
+            if identity_quality == 0 && !forbids_content {
+                vary_header(
+                    Response::text(406, "no acceptable content encoding"),
+                    "Accept-Encoding",
+                )
+            } else {
+                response
+            },
+        )
+    }
+    let limits = compress::Limits {
+        max_input_bytes: max_bytes,
+        max_output_bytes: max_bytes + max_bytes / 100 + 1024,
+        max_blocks: max_bytes / 32768 + 16,
+        max_work: max_bytes * 1024 + 65536,
+    };
+    let encoded = gzip::encode(response.bytes_value, limits, 1).map_err(
+        |error| Error::new(ErrorKind::Internal, error.to_string()),
+    )?;
+    let mut response = response.body(encoded).header("content-encoding", "gzip");
+    response = Response {
+        headers_value: response.headers().remove("content-md5").remove("digest").remove(
+            "content-digest",
+        ).remove("repr-digest"),
+        ..response,
+    };
+    if let Some(etag) = response.headers().get("etag") {
+        if etag != "" && !etag.starts_with("W/") {
+            response = response.header("etag", "W/" + etag);
+        }
+    }
+    Result::Ok(response)
 }

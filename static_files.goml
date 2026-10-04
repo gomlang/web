@@ -10,6 +10,11 @@ pub struct StaticFiles {
     max_bytes: isize,
 }
 
+struct StaticConditions {
+    method: string,
+    headers: Headers,
+}
+
 fn static_media_type(name: string) -> string {
     let name = name.to_ascii_lowercase();
     let parts = name.split(".");
@@ -116,9 +121,23 @@ fn static_range(value: string, size: isize) -> Option[(isize, isize)] {
 }
 
 fn static_etag_matches(values: Vec[string], etag: string, weak: bool) -> bool {
+    if values.is_empty() {
+        return false
+    }
     let value = values.join(",");
     if value.trim() == "*" {
         return true
+    }
+    if etag == "" || !weak && etag.starts_with("W/") {
+        return false
+    }
+    let etag = if weak && etag.starts_with("W/") {
+        etag.byte_slice(2, etag.byte_len())
+    } else {
+        etag
+    };
+    if etag == "" {
+        return false
     }
     let mut quoted = false;
     let mut start = 0;
@@ -146,6 +165,99 @@ fn static_etag_matches(values: Vec[string], etag: string, weak: bool) -> bool {
         start = index + 1;
     }
     matched
+}
+
+fn static_range_applies(conditions: StaticConditions, response: Response) -> bool {
+    let ranges = conditions.headers.get_all("range");
+    let etag = response.headers().get("etag").unwrap_or("");
+    if conditions.method != "GET" || ranges.is_empty() {
+        return false
+    }
+    if let Some(value) = conditions.headers.get("if-range") {
+        if etag == "" || etag.starts_with("W/") || value != etag {
+            return false
+        }
+    }
+    let value = ranges[0].trim();
+    value.split_once("=").map(|pair| pair.0).unwrap_or(value).eq_ignore_ascii_case("bytes")
+}
+
+fn static_empty(response: Response, status: isize) -> Response {
+    let headers = if response.bytes_value.is_empty() {
+        response.headers()
+    } else {
+        response.headers().remove("content-digest").remove("content-md5")
+    };
+    Response {
+        status_value: status,
+        bytes_value: Bytes::new(),
+        headers_value: if status == 304 {
+            headers
+        } else {
+            // A failed precondition or range produces an empty error response,
+            // not the representation whose digests the inner layer supplied.
+            headers.remove("content-encoding").remove("repr-digest").remove("digest")
+        },
+        ..response,
+    }
+}
+
+fn static_conditions(response: Response, conditions: StaticConditions) -> Response {
+    let etag = response.headers().get("etag").unwrap_or("");
+    let matches = conditions.headers.get_all("if-match");
+    if !matches.is_empty() && !static_etag_matches(matches, etag, false) {
+        return static_empty(response, 412)
+    }
+    if static_etag_matches(conditions.headers.get_all("if-none-match"), etag, true) {
+        return static_empty(response, 304)
+    }
+    if static_range_applies(conditions, response) {
+        let output = response.bytes_value;
+        let ranges = conditions.headers.get_all("range");
+        let value = ranges[0].trim();
+        let specification = value.split_once("=").map(|pair| pair.1).unwrap_or("");
+        let range = if ranges.len() == 1 {
+            static_range(specification, output.len())
+        } else {
+            Option::None
+        };
+        if let Some((start, end)) = range {
+            if start == end {
+                return response
+            }
+            let partial = Bytes::new();
+            partial.extend_from_slice(output.as_slice().sub(start, end));
+            return Response {
+                status_value: 206,
+                headers_value: if start == 0 && end == output.len() {
+                    response.headers()
+                } else {
+                    response.headers().remove("content-digest").remove("content-md5")
+                },
+                ..response,
+            }.body(partial).header(
+                "content-range",
+                "bytes " + start.to_string() + "-" + (end - 1).to_string() + "/"
+                    + output.len().to_string(),
+            )
+        }
+        return static_empty(response, 416).header(
+            "content-range",
+            "bytes */" + output.len().to_string(),
+        )
+    }
+    response
+}
+
+fn finish_static_conditions(response: Response) -> Response {
+    let conditions = response.static_conditions;
+    let response = Response { static_conditions: Option::None, ..response };
+    if response.status() == 200 {
+        if let Some(conditions) = conditions {
+            return static_conditions(response, conditions)
+        }
+    }
+    response
 }
 
 impl StaticFiles {
@@ -224,47 +336,18 @@ impl StaticFiles {
             "etag",
             etag,
         ).header("accept-ranges", "bytes").header("x-content-type-options", "nosniff");
-        let matches = request.headers().get_all("if-match");
-        if !matches.is_empty() && !static_etag_matches(matches, etag, false) {
-            return Result::Ok(Response { status_value: 412, ..base })
-        }
-        if static_etag_matches(request.headers().get_all("if-none-match"), etag, true) {
-            return Result::Ok(Response { status_value: 304, ..base })
-        }
-        let ranges = request.headers().get_all("range");
-        if request.method() == "GET" && !ranges.is_empty()
-            && request.headers().get("if-range").unwrap_or(etag) == etag {
-            let value = ranges[0].trim();
-            let (unit, specification) = value.split_once("=").unwrap_or((value, ""));
-            if unit.to_ascii_lowercase() != "bytes" {
-                return Result::Ok(base.body(output))
-            }
-            let range = if ranges.len() == 1 {
-                static_range(specification, output.len())
+        let response = Response {
+            static_conditions: Option::Some(
+                StaticConditions { method: request.method(), headers: request.headers() },
+            ),
+            ..base.body(output),
+        };
+        Result::Ok(
+            if request.defer_static_conditions {
+                response
             } else {
-                Option::None
-            };
-            if let Some((start, end)) = range {
-                if start == end {
-                    return Result::Ok(base.body(output))
-                }
-                let partial = Bytes::new();
-                partial.extend_from_slice(output.as_slice().sub(start, end));
-                return Result::Ok(
-                    Response { status_value: 206, ..base }.body(partial).header(
-                        "content-range",
-                        "bytes " + start.to_string() + "-" + (end - 1).to_string() + "/"
-                            + output.len().to_string(),
-                    ),
-                )
-            }
-            return Result::Ok(
-                Response { status_value: 416, ..base }.header(
-                    "content-range",
-                    "bytes */" + output.len().to_string(),
-                ),
-            )
-        }
-        Result::Ok(base.body(output))
+                finish_static_conditions(response)
+            },
+        )
     }
 }

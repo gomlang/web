@@ -1,6 +1,6 @@
 package tests;
 
-use ecosystem::request::{Client, RedirectPolicy};
+use ecosystem::request::{Client, Headers, RedirectPolicy};
 use ecosystem::web::{Router, Response};
 use ecosystem::web::proxy::{Proxy};
 use ecosystem::web::testing::{TestServer};
@@ -137,4 +137,71 @@ fn reverse_proxy_preserves_redirects_and_rejects_unsafe_targets() -> () {
     );
     testing::assert_eq(received.status().as_isize(), 302);
     testing::assert_eq(received.headers().get("location").unwrap_or(""), "/next");
+}
+
+#[test]
+fn reverse_proxy_selects_encoding_after_hop_header_removal() -> () {
+    let backend = testing::expect_ok(
+        TestServer::start(
+            Router::new().fallback(
+                |incoming| {
+                    let mut encodings = "";
+                    for value in incoming.headers().get_all("accept-encoding") {
+                        encodings = encodings + "[" + value + "]";
+                    }
+                    Result::Ok(
+                        Response::text(200, encodings).header(
+                            "x-default",
+                            incoming.headers().get("x-default").unwrap_or(""),
+                        ),
+                    )
+                },
+            ),
+        ),
+        "encoding backend",
+    );
+    defer {
+        let _ = backend.shutdown(Duration::from_seconds(2));
+    };
+    let headers = testing::expect_ok(
+        Headers::new().insert("accept-encoding", "gzip"),
+        "default encoding",
+    );
+    let headers = testing::expect_ok(headers.insert("x-default", "retained"), "other default");
+    let outbound = testing::expect_ok(
+        Client::builder().default_headers(headers).build(),
+        "proxy client",
+    );
+    defer outbound.close();
+    let proxy = testing::expect_ok(Proxy::new(backend.base_url(), outbound, 1024, 1024), "proxy");
+    let frontend = testing::expect_ok(
+        TestServer::start(Router::new().fallback(proxy.handler())),
+        "frontend",
+    );
+    defer {
+        let _ = frontend.shutdown(Duration::from_seconds(2));
+    };
+    let inbound = testing::expect_ok(Client::builder().gzip(false).build(), "raw client");
+    defer inbound.close();
+    let cases: Vec[(Vec[(string, string)], string)] = Vec::from_array(
+        [
+            (Vec::new(), "[identity]"),
+            (Vec::from_array([("accept-encoding", "")]), "[]"),
+            (Vec::from_array([("accept-encoding", "identity")]), "[identity]"),
+            (
+                Vec::from_array([("accept-encoding", "gzip"), ("accept-encoding", "identity;q=0")]),
+                "[gzip][identity;q=0]",
+            ),
+        ],
+    );
+    for (fields, expected) in cases {
+        let mut sent = inbound.get(frontend.base_url() + "/");
+        for (name, value) in fields {
+            sent = sent.append_header(name, value);
+        }
+        let received = testing::expect_ok(sent.send(), "encoding echo " + expected);
+        testing::assert_eq(received.status().as_isize(), 200);
+        testing::assert_eq(testing::expect_ok(received.text(), "encoding fields"), expected);
+        testing::assert_eq(received.headers().get("x-default").unwrap_or(""), "retained");
+    }
 }

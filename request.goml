@@ -157,6 +157,7 @@ impl Body {
 }
 
 pub struct Request {
+    defer_static_conditions: bool,
     http11_value: bool,
     lifetime: Lifetime,
     body_value: Body,

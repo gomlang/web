@@ -1,0 +1,143 @@
+package tests;
+
+use ecosystem::request as client;
+use ecosystem::web;
+use ecosystem::compress;
+use ecosystem::compress::gzip;
+use std::bytes::{Bytes};
+use std::crypto::hash;
+use std::encoding::base64;
+use std::encoding::hex;
+use std::fs;
+use std::testing;
+use std::time::{Duration};
+
+fn static_digest(bytes: Bytes) -> string {
+    "sha-256=:" + base64::encode(testing::expect_ok(hex::decode(hash::sha256(bytes)), "hash bytes"))
+        + ":"
+}
+
+fn static_digest_case(status: isize) -> () {
+    let connection = testing::expect_ok(client::Client::new(), "HTTP client");
+    defer connection.close();
+    for mode in["identity", "no-transform", "preencoded"] {
+        let root = "_artifact/static-digest-" + mode + "-" + status.to_string();
+        testing::assert_ok(fs::create_dir_all(root));
+        let plain = Bytes::from_string("0123456789");
+        let bytes = if mode == "preencoded" {
+            testing::expect_ok(
+                gzip::encode(
+                    plain,
+                    compress::Limits {
+                        max_input_bytes: 1024,
+                        max_output_bytes: 2048,
+                        max_blocks: 32,
+                        max_work: 1000000,
+                    },
+                    1,
+                ),
+                "preencoded file",
+            )
+        } else {
+            plain
+        };
+        testing::assert_ok(fs::write_bytes_structured(root + "/file.txt", bytes));
+        let full_digest = static_digest(bytes);
+        let old_digest = "sha-256="
+            + base64::encode(testing::expect_ok(hex::decode(hash::sha256(bytes)), "hash bytes"));
+        let files = testing::expect_ok(web::StaticFiles::new(root, 1024), "static files");
+        let router = web::Router::new().get("/{*path}", files.handler("path")).layer(
+            testing::expect_ok(web::compression(1024), "compression"),
+        ).layer(
+            |request, next| {
+                let response = next.run(request)?;
+                testing::assert_eq(response.status(), 200);
+                let response = response.header(
+                    "content-digest",
+                    if request.method() == "HEAD" {
+                        static_digest(Bytes::new())
+                    } else {
+                        full_digest
+                    },
+                ).header("repr-digest", full_digest).header("digest", old_digest);
+                Result::Ok(
+                    match mode {
+                        "no-transform" => response.header("cache-control", "no-transform"),
+                        "preencoded" => response.header("content-encoding", "gzip"),
+                        _ => response,
+                    },
+                )
+            },
+        );
+        let server = transport_server(router);
+        defer {
+            let _ = server.shutdown(Duration::from_seconds(1));
+            let _ = files.close();
+        };
+        let encoding = if mode == "identity" {
+            "identity"
+        } else {
+            "gzip"
+        };
+        let full = conditional_request(connection, server, encoding, Vec::new());
+        testing::assert_eq(full.status().as_isize(), 200);
+        testing::assert_eq(
+            full.headers().get("content-digest").unwrap_or(""),
+            static_digest(full.bytes()),
+        );
+        testing::assert_eq(full.headers().get("repr-digest").unwrap_or(""), full_digest);
+        let head = conditional_method(connection, server, "HEAD", encoding, Vec::new());
+        testing::assert(head.bytes().is_empty());
+        testing::assert_eq(
+            head.headers().get("content-digest").unwrap_or(""),
+            static_digest(head.bytes()),
+        );
+        testing::assert_eq(head.headers().get("repr-digest").unwrap_or(""), full_digest);
+        let whole_range = conditional_request(
+            connection,
+            server,
+            encoding,
+            Vec::from_array([("range", "bytes=0-" + (bytes.len() - 1).to_string())]),
+        );
+        testing::assert_eq(whole_range.status().as_isize(), 206);
+        testing::assert_eq(whole_range.headers().get("content-digest").unwrap_or(""), full_digest);
+        let fields = match status {
+            206 => Vec::from_array([("range", "bytes=2-4")]),
+            304 => Vec::from_array([("if-none-match", full.headers().get("etag").unwrap_or(""))]),
+            412 => Vec::from_array([("if-match", "\"different\"")]),
+            _ => Vec::from_array([("range", "bytes=1000-")]),
+        };
+        let changed = conditional_request(connection, server, encoding, fields);
+        testing::assert_eq(changed.status().as_isize(), status);
+        if let Some(value) = changed.headers().get("content-digest") {
+            testing::assert_eq(value, static_digest(changed.bytes()));
+        }
+        if status == 206 || status == 304 {
+            testing::assert_eq(changed.headers().get("repr-digest").unwrap_or(""), full_digest);
+            testing::assert_eq(changed.headers().get("digest").unwrap_or(""), old_digest);
+        } else {
+            testing::assert(changed.headers().get("repr-digest").is_none());
+            testing::assert(changed.headers().get("digest").is_none());
+        }
+    }
+}
+
+#[test]
+fn static_digest_range_cannot_retain_a_digest_of_the_full_content() -> () {
+    static_digest_case(206);
+}
+
+#[test]
+fn static_digest_not_modified_has_no_full_content_digest() -> () {
+    static_digest_case(304);
+}
+
+#[test]
+fn static_digest_failed_precondition_has_no_stale_integrity_fields() -> () {
+    static_digest_case(412);
+}
+
+#[test]
+fn static_digest_unsatisfied_range_has_no_stale_integrity_fields() -> () {
+    static_digest_case(416);
+}

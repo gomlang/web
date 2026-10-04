@@ -146,6 +146,31 @@ response validation rejects buffered content and stream producers for these
 statuses. A 205 response retains ordinary `Content-Length: 0` framing.
 Streaming responses retain their existing bounded transport behavior.
 
+When combined with `StaticFiles`, compression selects the complete response's
+encoding before evaluating `If-Match`, `If-None-Match` and ranges. A gzip 304
+keeps the same weak ETag as its corresponding 200; an identity response retains
+its strong ETag. This lets caches refresh the representation under
+[RFC 9111 section 4.3.4](https://www.rfc-editor.org/rfc/rfc9111.html#section-4.3.4).
+An unacceptable encoding produces 406 before conditional checks. For otherwise
+unencoded static responses, supported byte ranges select identity, which must
+still be acceptable; an unusable `If-Range` ignores the range and allows the full
+response to use gzip. HEAD uses the corresponding full GET representation's
+encoding and validator; 304 has neither body bytes nor Content-Length.
+Inner middleware sees the complete static response before these checks, so its
+ETag, encoding and `no-transform` changes participate in selection. Replacing
+that response with a new response or stream transfers responsibility for
+conditional handling to the replacement. Nested compression layers finalize
+static conditions only after the outermost layer has selected the response.
+When conditions remove or slice content, stale `Content-Digest` and
+`Content-MD5` fields are removed. A 206 or 304 retains the complete selected
+representation's `Repr-Digest` and legacy `Digest`; empty 412/416 errors discard
+those representation digests too. Middleware that supplies `Content-Digest`
+for HEAD must calculate it over empty content, while `Repr-Digest` can describe
+the corresponding full GET representation.
+Custom handlers that directly return 304 remain responsible for evaluating
+conditions against their final representation; compression cannot infer an
+absent representation's size or encoding from a 304 alone.
+
 ## Sessions, CSRF and rate limiting
 
 These facilities are opt-in router layers. Session and limiter state is shared

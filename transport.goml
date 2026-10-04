@@ -438,6 +438,7 @@ fn make_request(
     limits: Limits,
 ) -> Request {
     Request {
+        defer_static_conditions: false,
         http11_value: head.http11,
         lifetime,
         body_value: Body { state: body },

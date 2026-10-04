@@ -67,6 +67,7 @@ impl Event {
 }
 
 pub struct Response {
+    static_conditions: Option[StaticConditions],
     upgrade_value: Option[WebSocketUpgrade],
     status_value: isize,
     headers_value: Headers,
@@ -78,6 +79,7 @@ pub struct Response {
 impl Response {
     pub fn new(status: isize) -> Response {
         Response {
+            static_conditions: Option::None,
             upgrade_value: Option::None,
             status_value: status,
             headers_value: Headers::new(),

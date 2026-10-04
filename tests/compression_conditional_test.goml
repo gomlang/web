@@ -1,0 +1,471 @@
+package tests;
+
+use ecosystem::request as client;
+use ecosystem::web;
+use ecosystem::web::proxy::{Proxy};
+use ecosystem::compress;
+use ecosystem::compress::gzip;
+use std::bytes::{Bytes};
+use std::fs;
+use std::testing;
+use std::time::{Duration};
+
+fn conditional_request(
+    connection: client::Client,
+    server: web::Server,
+    encoding: string,
+    fields: Vec[(string, string)],
+) -> client::Response {
+    conditional_method(connection, server, "GET", encoding, fields)
+}
+
+fn conditional_method(
+    connection: client::Client,
+    server: web::Server,
+    method: string,
+    encoding: string,
+    fields: Vec[(string, string)],
+) -> client::Response {
+    let address = testing::expect_ok(server.address(), "static TCP address");
+    let mut request = connection.request(method, "http://" + address + "/file.txt").header(
+        "accept-encoding",
+        encoding,
+    );
+    for (name, value) in fields {
+        request = request.header(name, value);
+    }
+    testing::expect_ok(request.send(), "static TCP response")
+}
+
+#[test]
+fn static_range_selection_preserves_identity_and_strong_preconditions() -> () {
+    let (files, server) = conditional_server("_artifact/compression-conditional-range", 1024);
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+        let _ = files.close();
+    };
+    let connection = testing::expect_ok(client::Client::new(), "HTTP client");
+    defer connection.close();
+    let full = conditional_request(connection, server, "identity", Vec::new());
+    let etag = testing::expect_some(full.headers().get("etag"), "identity ETag");
+    for encoding in["identity", "gzip"] {
+        let partial = conditional_request(
+            connection,
+            server,
+            encoding,
+            Vec::from_array([("range", "bytes=2-4"), ("if-range", etag)]),
+        );
+        testing::assert_eq(partial.status().as_isize(), 206);
+        testing::assert_eq(testing::expect_ok(partial.text(), "range bytes"), "234");
+        testing::assert_eq(partial.headers().get("etag").unwrap_or(""), etag);
+        testing::assert_eq(partial.headers().get("content-range").unwrap_or(""), "bytes 2-4/10");
+        testing::assert(partial.headers().get("content-encoding").is_none());
+    }
+    for tag in["W/" + etag, "\"different\""] {
+        let ignored = conditional_request(
+            connection,
+            server,
+            "gzip",
+            Vec::from_array([("range", "bytes=2-4"), ("if-range", tag)]),
+        );
+        testing::assert_eq(ignored.status().as_isize(), 200);
+        testing::assert_eq(ignored.headers().get("etag").unwrap_or(""), "W/" + etag);
+        testing::assert_eq(ignored.headers().get("content-encoding").unwrap_or(""), "gzip");
+        testing::assert(ignored.headers().get("content-range").is_none());
+    }
+    let rejected = conditional_request(
+        connection,
+        server,
+        "gzip, identity;q=0",
+        Vec::from_array([("range", "bytes=2-4"), ("if-range", etag)]),
+    );
+    testing::assert_eq(rejected.status().as_isize(), 406);
+    let failed = conditional_request(
+        connection,
+        server,
+        "gzip",
+        Vec::from_array(
+            [("if-match", "\"different\""), ("if-none-match", etag), ("range", "bytes=2-4")],
+        ),
+    );
+    testing::assert_eq(failed.status().as_isize(), 412);
+    let cached = conditional_request(
+        connection,
+        server,
+        "gzip",
+        Vec::from_array([("if-none-match", "W/" + etag), ("range", "bytes=2-4")]),
+    );
+    testing::assert_eq(cached.status().as_isize(), 304);
+    testing::assert_eq(cached.headers().get("etag").unwrap_or(""), etag);
+    testing::assert(cached.headers().get("content-range").is_none());
+}
+
+#[test]
+fn static_head_and_nested_compression_finalize_one_representation() -> () {
+    let root = "_artifact/compression-conditional-head";
+    testing::assert_ok(fs::create_dir_all(root));
+    testing::assert_ok(fs::write_file_structured(root + "/file.txt", "0123456789"));
+    let files = testing::expect_ok(web::StaticFiles::new(root, 100), "static files");
+    defer {
+        let _ = files.close();
+    };
+    let router = web::Router::new().get("/{*path}", files.handler("path")).layer(
+        testing::expect_ok(web::compression(1024), "outer compression"),
+    ).layer(testing::expect_ok(web::compression(1), "inner compression"));
+    let server = transport_server(router);
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+    };
+    let connection = testing::expect_ok(client::Client::new(), "HTTP client");
+    defer connection.close();
+    for encoding in["identity", "gzip"] {
+        let full = conditional_request(connection, server, encoding, Vec::new());
+        let etag = testing::expect_some(full.headers().get("etag"), "GET ETag");
+        let head = conditional_method(connection, server, "HEAD", encoding, Vec::new());
+        testing::assert_eq(head.status().as_isize(), 200);
+        testing::assert(head.bytes().is_empty());
+        for name in["etag", "content-length", "content-encoding"] {
+            testing::assert(head.headers().get(name) == full.headers().get(name));
+        }
+        let cached = conditional_method(
+            connection,
+            server,
+            "HEAD",
+            encoding,
+            Vec::from_array([("if-none-match", etag), ("range", "bytes=2-4")]),
+        );
+        testing::assert_eq(cached.status().as_isize(), 304);
+        testing::assert(cached.bytes().is_empty());
+        testing::assert(cached.headers().get("content-length").is_none());
+        testing::assert_eq(cached.headers().get("etag").unwrap_or(""), etag);
+        testing::assert(
+            cached.headers().get("content-encoding") == full.headers().get("content-encoding"),
+        );
+    }
+}
+
+fn conditional_server(directory: string, maximum: isize) -> (web::StaticFiles, web::Server) {
+    testing::assert_ok(fs::create_dir_all(directory));
+    testing::assert_ok(fs::write_file_structured(directory + "/file.txt", "0123456789"));
+    let files = testing::expect_ok(web::StaticFiles::new(directory, 100), "static files");
+    let router = web::Router::new().get("/{*path}", files.handler("path")).layer(
+        testing::expect_ok(web::compression(maximum), "compression"),
+    );
+    (files, transport_server(router))
+}
+
+#[test]
+fn compressed_static_revalidation_preserves_the_selected_etag() -> () {
+    let (files, server) = conditional_server("_artifact/compression-conditional-etag", 1024);
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+        let _ = files.close();
+    };
+    let connection = testing::expect_ok(client::Client::new(), "HTTP client");
+    defer connection.close();
+    for encoding in["identity", "gzip"] {
+        let full = conditional_request(connection, server, encoding, Vec::new());
+        testing::assert_eq(full.status().as_isize(), 200);
+        let etag = testing::expect_some(full.headers().get("etag"), "full ETag");
+        testing::assert_eq(etag.starts_with("W/"), encoding == "gzip");
+        let checked = conditional_request(
+            connection,
+            server,
+            encoding,
+            Vec::from_array([("if-none-match", etag)]),
+        );
+        testing::assert_eq(checked.status().as_isize(), 304);
+        testing::assert(checked.bytes().is_empty());
+        testing::assert_eq(checked.headers().get("etag").unwrap_or(""), etag);
+    }
+}
+
+#[test]
+fn compressed_static_if_match_uses_the_selected_representation() -> () {
+    let (files, server) = conditional_server("_artifact/compression-conditional-match", 1024);
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+        let _ = files.close();
+    };
+    let connection = testing::expect_ok(client::Client::new(), "HTTP client");
+    defer connection.close();
+    let full = conditional_request(connection, server, "identity", Vec::new());
+    let etag = testing::expect_some(full.headers().get("etag"), "identity ETag");
+    let identity = conditional_request(
+        connection,
+        server,
+        "identity",
+        Vec::from_array([("if-match", etag)]),
+    );
+    testing::assert_eq(identity.status().as_isize(), 200);
+    let compressed = conditional_request(
+        connection,
+        server,
+        "gzip",
+        Vec::from_array([("if-match", etag)]),
+    );
+    testing::assert_eq(compressed.status().as_isize(), 412);
+}
+
+#[test]
+fn static_encoding_rejection_precedes_not_modified() -> () {
+    let (files, server) = conditional_server("_artifact/compression-conditional-rejection", 1024);
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+        let _ = files.close();
+    };
+    let connection = testing::expect_ok(client::Client::new(), "HTTP client");
+    defer connection.close();
+    let full = conditional_request(connection, server, "identity", Vec::new());
+    let etag = testing::expect_some(full.headers().get("etag"), "identity ETag");
+    let rejected = conditional_request(
+        connection,
+        server,
+        "gzip;q=0, identity;q=0",
+        Vec::from_array([("if-none-match", etag)]),
+    );
+    testing::assert_eq(rejected.status().as_isize(), 406);
+}
+
+#[test]
+fn static_uncompressed_limits_preserve_strong_validators() -> () {
+    let connection = testing::expect_ok(client::Client::new(), "HTTP client");
+    defer connection.close();
+    for maximum in[0, 1, 9, 10] {
+        let (files, server) = conditional_server(
+            "_artifact/compression-conditional-limit-" + maximum.to_string(),
+            maximum,
+        );
+        defer {
+            let _ = server.shutdown(Duration::from_seconds(1));
+            let _ = files.close();
+        };
+        let full = conditional_request(connection, server, "gzip", Vec::new());
+        let etag = testing::expect_some(full.headers().get("etag"), "bounded ETag");
+        testing::assert_eq(etag.starts_with("W/"), maximum == 10);
+        let checked = conditional_request(
+            connection,
+            server,
+            "gzip",
+            Vec::from_array([("if-none-match", etag)]),
+        );
+        testing::assert_eq(checked.status().as_isize(), 304);
+        testing::assert_eq(checked.headers().get("etag").unwrap_or(""), etag);
+        let exclusive = conditional_request(
+            connection,
+            server,
+            "gzip, identity;q=0",
+            Vec::from_array([("if-none-match", etag)]),
+        );
+        testing::assert_eq(
+            exclusive.status().as_isize(),
+            if maximum == 10 {
+                304
+            } else {
+                406
+            },
+        );
+    }
+}
+
+#[test]
+fn static_conditionals_observe_inner_middleware_representation_changes() -> () {
+    let connection = testing::expect_ok(client::Client::new(), "HTTP client");
+    defer connection.close();
+    for mode in[
+        "etag",
+        "no-transform",
+        "encoding",
+        "stream",
+        "replacement",
+        "empty-etag",
+        "weak-etag",
+    ] {
+        let root = "_artifact/compression-conditional-inner-" + mode;
+        testing::assert_ok(fs::create_dir_all(root));
+        let original = Bytes::from_string("0123456789");
+        let bytes = if mode == "encoding" {
+            testing::expect_ok(
+                gzip::encode(
+                    original,
+                    compress::Limits {
+                        max_input_bytes: 1024,
+                        max_output_bytes: 2048,
+                        max_blocks: 32,
+                        max_work: 1000000,
+                    },
+                    1,
+                ),
+                "preencoded static file",
+            )
+        } else {
+            original
+        };
+        testing::assert_ok(fs::write_bytes_structured(root + "/file.txt", bytes));
+        let files = testing::expect_ok(web::StaticFiles::new(root, 1024), "static files");
+        let router = web::Router::new().get("/{*path}", files.handler("path")).layer(
+            testing::expect_ok(web::compression(1024), "outer compression"),
+        ).layer(
+            |request, next| {
+                let response = next.run(request)?;
+                Result::Ok(
+                    match mode {
+                        "etag" => response.header("etag", "\"custom\""),
+                        "empty-etag" => response.header("etag", ""),
+                        "weak-etag" => response.header("etag", "W/\"custom\""),
+                        "no-transform" => response.header("cache-control", "no-transform"),
+                        "encoding" => response.header("content-encoding", "gzip"),
+                        "stream" => web::Response::stream(
+                            200,
+                            "text/plain",
+                            |writer| writer.text("streamed"),
+                        ).header("etag", "\"custom\""),
+                        _ => web::Response::text(200, "replacement").header("etag", "\"custom\""),
+                    },
+                )
+            },
+        );
+        let server = transport_server(router);
+        defer {
+            let _ = server.shutdown(Duration::from_seconds(1));
+            let _ = files.close();
+        };
+        let encoding = "gzip";
+        let full = conditional_request(connection, server, encoding, Vec::new());
+        testing::assert_eq(full.status().as_isize(), 200);
+        let etag = testing::expect_some(full.headers().get("etag"), "modified ETag");
+        testing::assert_eq(
+            etag.starts_with("W/"),
+            mode == "etag" || mode == "replacement" || mode == "weak-etag",
+        );
+        let checked = conditional_request(
+            connection,
+            server,
+            encoding,
+            Vec::from_array([("if-none-match", etag)]),
+        );
+        let replaced = mode == "stream" || mode == "replacement" || mode == "empty-etag";
+        testing::assert_eq(
+            checked.status().as_isize(),
+            if replaced {
+                200
+            } else {
+                304
+            },
+        );
+        testing::assert_eq(checked.headers().get("etag").unwrap_or(""), etag);
+        if !replaced {
+            testing::assert(checked.bytes().is_empty());
+            testing::assert(checked.headers().get("content-length").is_none());
+            testing::assert(
+                checked.headers().get("content-encoding") == full.headers().get("content-encoding"),
+            );
+        }
+        if mode == "encoding" {
+            testing::assert(full.bytes().to_vec_copy() == bytes.to_vec_copy());
+        }
+        if mode == "weak-etag" || mode == "empty-etag" {
+            let partial = conditional_request(
+                connection,
+                server,
+                "gzip",
+                Vec::from_array([("range", "bytes=2-4")]),
+            );
+            testing::assert_eq(partial.status().as_isize(), 206);
+            testing::assert_eq(testing::expect_ok(partial.text(), "custom validator range"), "234");
+            testing::assert(partial.headers().get("content-encoding").is_none());
+            let ignored = conditional_request(
+                connection,
+                server,
+                "identity",
+                Vec::from_array([("range", "bytes=2-4"), ("if-range", etag)]),
+            );
+            testing::assert_eq(ignored.status().as_isize(), 200);
+            testing::assert_eq(
+                testing::expect_ok(ignored.text(), "unusable If-Range"),
+                "0123456789",
+            );
+        }
+        if mode == "no-transform" || mode == "stream" {
+            let rejected = conditional_request(
+                connection,
+                server,
+                "gzip, identity;q=0",
+                Vec::from_array([("if-none-match", etag)]),
+            );
+            testing::assert_eq(rejected.status().as_isize(), 406);
+        }
+    }
+}
+
+#[test]
+fn proxy_static_revalidation_preserves_the_forwarded_content_encoding() -> () {
+    let (files, backend) = conditional_server("_artifact/compression-conditional-proxy", 1024);
+    defer {
+        let _ = backend.shutdown(Duration::from_seconds(1));
+        let _ = files.close();
+    };
+    let outbound = testing::expect_ok(client::Client::new(), "proxy client");
+    defer outbound.close();
+    let proxy = testing::expect_ok(
+        Proxy::new(
+            "http://" + testing::expect_ok(backend.address(), "backend address"),
+            outbound,
+            1024,
+            1024,
+        ),
+        "proxy",
+    );
+    let frontend = transport_server(web::Router::new().fallback(proxy.handler()));
+    defer {
+        let _ = frontend.shutdown(Duration::from_seconds(1));
+    };
+    let inbound = testing::expect_ok(client::Client::builder().gzip(false).build(), "raw client");
+    defer inbound.close();
+    let url = "http://" + testing::expect_ok(frontend.address(), "frontend address") + "/file.txt";
+    for encoding in[
+        Option::None,
+        Option::Some(""),
+        Option::Some("gzip"),
+        Option::Some("identity"),
+        Option::Some("gzip;q=0"),
+        Option::Some("gzip, identity;q=0"),
+    ] {
+        let mut initial = inbound.get(url);
+        if let Some(value) = encoding {
+            initial = initial.header("accept-encoding", value);
+        }
+        let full = testing::expect_ok(initial.send(), "proxied representation");
+        testing::assert_eq(full.status().as_isize(), 200);
+        let etag = testing::expect_some(full.headers().get("etag"), "proxy ETag");
+        let mut check = inbound.get(url).header("if-none-match", etag);
+        if let Some(value) = encoding {
+            check = check.header("accept-encoding", value);
+        }
+        let checked = testing::expect_ok(check.send(), "proxied revalidation");
+        testing::assert_eq(checked.status().as_isize(), 304);
+        testing::assert(checked.bytes().is_empty());
+        testing::assert_eq(checked.headers().get("etag").unwrap_or(""), etag);
+        testing::assert_eq(
+            checked.headers().get("content-encoding").unwrap_or(""),
+            full.headers().get("content-encoding").unwrap_or(""),
+        );
+    }
+    let full = testing::expect_ok(inbound.get(url).send(), "default proxied representation");
+    let etag = testing::expect_some(full.headers().get("etag"), "default proxy ETag");
+    for (condition, expected) in[("", "200"), ("If-None-Match: " + etag + "\r\n", "304")] {
+        let received = transport_request(
+            frontend,
+            "GET /file.txt HTTP/1.1\r\nHost: local\r\nConnection: close, Accept-Encoding\r\nAccept-Encoding: gzip\r\n"
+                + condition
+                + "\r\n",
+        );
+        testing::assert_eq(received.split(" ")[1], expected);
+        testing::assert(!received.to_ascii_lowercase().contains("\r\ncontent-encoding:"));
+        if expected == "200" {
+            testing::assert(received.ends_with("0123456789"));
+        } else {
+            testing::assert(received.ends_with("\r\n\r\n"));
+        }
+    }
+}

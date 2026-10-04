@@ -69,13 +69,20 @@ impl Proxy {
         let mut outbound = self.client.request(incoming.method(), target).redirect(
             request::RedirectPolicy::None,
         ).body_limit(self.response_limit).body(body);
+        let mut has_accept_encoding = false;
         for (name, value) in clean {
-            if name != "host" && name != "content-length" && name != "forwarded"
+            if name == "accept-encoding" && !has_accept_encoding {
+                outbound = outbound.header(name, value);
+                has_accept_encoding = true;
+            } else if name != "host" && name != "content-length" && name != "forwarded"
                 && name != "x-forwarded-for"
                 && name != "x-forwarded-host"
                 && name != "x-forwarded-proto" {
                 outbound = outbound.append_header(name, value);
             }
+        }
+        if !has_accept_encoding {
+            outbound = outbound.header("accept-encoding", "identity");
         }
         let remote = net::SocketAddr::parse(incoming.remote_address()?).map_err(
             |_| web::Error::new(web::ErrorKind::Internal, "invalid peer address"),
