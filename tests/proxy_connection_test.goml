@@ -1,0 +1,104 @@
+package tests;
+
+use ecosystem::request::{Client};
+use ecosystem::web::{Router, Response};
+use ecosystem::web::proxy::{Proxy};
+use std::net;
+use std::task;
+use std::testing;
+use std::time::{Duration};
+
+#[test]
+fn proxy_connection_lists_accept_empty_members_on_incoming_requests() -> () {
+    let backend = transport_server(
+        Router::new().get(
+            "/",
+            |incoming| {
+                Result::Ok(
+                    Response::text(
+                        200,
+                        incoming.headers().get("x-private").unwrap_or("missing") + ":"
+                            + incoming.headers().get_all("x-end").join(","),
+                    ),
+                )
+            },
+        ),
+    );
+    defer {
+        let _ = backend.shutdown(Duration::from_seconds(2));
+    };
+    let outbound = testing::expect_ok(Client::new(), "outbound");
+    defer outbound.close();
+    let proxy = testing::expect_ok(
+        Proxy::new(
+            "http://" + testing::expect_ok(backend.address(), "backend"),
+            outbound,
+            1024,
+            1024,
+        ),
+        "proxy",
+    );
+    let frontend = transport_server(Router::new().fallback(proxy.handler()));
+    defer {
+        let _ = frontend.shutdown(Duration::from_seconds(2));
+    };
+    for (value, expected) in[(" , x-private, ,", "missing"), (" , \t, ", "secret")] {
+        let response = transport_request(
+            frontend,
+            "GET / HTTP/1.1\r\nHost: local\r\nConnection: close\r\nConnection: " + value
+                + "\r\nX-Private: secret\r\nX-End: one\r\nX-End: two\r\n\r\n",
+        );
+        testing::assert_eq(response.split(" ")[1], "200");
+        testing::assert(response.ends_with(expected + ":one,two"));
+    }
+}
+
+#[test]
+fn proxy_connection_lists_accept_empty_members_on_upstream_responses() -> () {
+    let listener = testing::expect_ok(
+        net::TcpListener::bind(testing::expect_ok(net::SocketAddr::parse("127.0.0.1:0"), "address")),
+        "backend listener",
+    );
+    defer {
+        let _ = listener.close();
+    };
+    let address = testing::expect_ok(listener.local_addr(), "backend address");
+    let outbound = testing::expect_ok(Client::new(), "outbound");
+    defer outbound.close();
+    let proxy = testing::expect_ok(
+        Proxy::new("http://" + address.to_string(), outbound, 1024, 1024),
+        "proxy",
+    );
+    let frontend = transport_server(Router::new().fallback(proxy.handler()));
+    defer {
+        let _ = frontend.shutdown(Duration::from_seconds(2));
+    };
+    task::scope(
+        |scope| {
+            let _ = scope.spawn(
+                |_| {
+                    let stream = testing::expect_ok(
+                        listener.accept_with(transport_wait()),
+                        "accept backend",
+                    ).0;
+                    defer {
+                        let _ = stream.close();
+                    };
+                    let _ = transport_head(stream);
+                    transport_send(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nConnection: ,close, X-Private,,\r\nX-Private: hidden\r\nX-End: one\r\nX-End: two\r\nContent-Length: 2\r\n\r\nok",
+                    );
+                },
+            );
+            let response = transport_request(
+                frontend,
+                "GET / HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
+            );
+            testing::assert_eq(response.split(" ")[1], "200");
+            testing::assert(response.ends_with("\r\n\r\nok"));
+            testing::assert(!response.to_ascii_lowercase().contains("x-private:"));
+            testing::assert(response.contains("x-end: one\r\nx-end: two\r\n"));
+        },
+    );
+}

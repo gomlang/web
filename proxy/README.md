@@ -24,7 +24,8 @@ return 502, and upstream timeouts return 504. The incoming request context
 cancels the outbound exchange on disconnect or deadline.
 
 Hop-by-hop headers, including names nominated by `Connection`, are removed on
-both legs. The proxy does not forward an incoming `Forwarded` or
+both legs. Empty members in Connection lists are ignored; nonempty members
+still require valid tokens. The proxy does not forward an incoming `Forwarded` or
 `X-Forwarded-*` value. It sets `X-Forwarded-For` from the connected peer,
 `X-Forwarded-Host` from the inbound Host and `X-Forwarded-Proto` from the actual
 inbound transport: `http` for TCP and `https` for a TLS listener. Client-supplied
