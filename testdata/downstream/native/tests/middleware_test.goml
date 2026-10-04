@@ -19,7 +19,7 @@ fn consumer_can_compose_public_cors_and_compression_middleware() -> () {
         web::Headers::new().append("origin", "https://consumer.example"),
         "origin",
     );
-    let headers = testing::expect_ok(headers.append("accept-encoding", "gzip"), "encoding");
+    let headers = testing::expect_ok(headers.append("accept-encoding", "gzip;Q=1"), "encoding");
     let response = testing::expect_ok(
         router.dispatch("GET", "/", headers, Bytes::new()),
         "dispatch",

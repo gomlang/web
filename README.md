@@ -129,7 +129,7 @@ existing Linux file-descriptor API.
 
 `Cors` validates explicit origins, methods and headers, handles preflight requests, and maintains `Vary: Origin`. Builders also configure exposed headers, credentials and preflight cache age. Credentialed requests require explicit origins; a wildcard origin cannot enable credentials. Disallowed origins, methods and requested headers receive 403.
 
-`compression(max_bytes)` negotiates gzip and identity using `Accept-Encoding` quality values. It compresses buffered responses within the bound, preserves `Vary`, weakens representation ETags, and removes obsolete content digests. Existing encodings, range responses, upgrades, streams/SSE and `Cache-Control: no-transform` remain outside compression. If no available representation is acceptable it returns 406. Streaming responses retain their existing bounded transport behavior.
+`compression(max_bytes)` negotiates gzip and identity using `Accept-Encoding` quality values. Coding names and the `q` parameter name are case-insensitive, as required by [RFC 9110 section 12.4.2](https://www.rfc-editor.org/rfc/rfc9110.html#section-12.4.2). It compresses buffered responses within the bound, preserves `Vary`, weakens representation ETags, and removes obsolete content digests. Existing encodings, range responses, upgrades, streams/SSE and `Cache-Control: no-transform` remain outside compression. If no available representation is acceptable it returns 406. Streaming responses retain their existing bounded transport behavior.
 
 ## Sessions, CSRF and rate limiting
 

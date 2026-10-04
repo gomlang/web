@@ -1,0 +1,47 @@
+package tests;
+
+use ecosystem::web;
+use std::bytes::{Bytes};
+use std::testing;
+
+#[test]
+fn compression_quality_parameter_is_case_insensitive() -> () {
+    let router = web::Router::new().get("/", |_| Result::Ok(web::Response::text(200, "response"))).layer(
+        testing::expect_ok(web::compression(1024), "compression"),
+    );
+    for (value, status, coding) in[
+        ("gzip;Q=1", 200, "gzip"),
+        ("gzip;Q=0, identity;q=1", 200, ""),
+        ("gzip;q=0.5, identity;Q=0", 200, "gzip"),
+        ("gzip;Q=0.1, identity;Q=1", 200, ""),
+        ("*;Q=1, identity;Q=0", 200, "gzip"),
+        ("*;Q=0", 406, ""),
+    ] {
+        let response = extras_dispatch(
+            router,
+            "GET",
+            "/",
+            extras_header(web::Headers::new(), "accept-encoding", value),
+            Bytes::new(),
+        );
+        testing::assert_eq(response.status, status);
+        testing::assert_eq(response.headers.get("content-encoding").unwrap_or(""), coding);
+    }
+}
+
+#[test]
+fn compression_quality_rejects_invalid_values_and_other_parameters() -> () {
+    let router = web::Router::new().get("/", |_| Result::Ok(web::Response::text(200, "response"))).layer(
+        testing::expect_ok(web::compression(1024), "compression"),
+    );
+    for value in["gzip;Q=2", "gzip;Q=-1", "gzip;Q=0.1234", "gzip;Q=NaN", "gzip;other=1"] {
+        let response = extras_dispatch(
+            router,
+            "GET",
+            "/",
+            extras_header(web::Headers::new(), "accept-encoding", value),
+            Bytes::new(),
+        );
+        testing::assert_eq(response.status, 400);
+    }
+}

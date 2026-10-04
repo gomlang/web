@@ -51,7 +51,7 @@ fn accepted_encodings(headers: Headers) -> Result[(isize, isize), Error] {
                 let (key, value) = parts[1].trim().split_once("=").ok_or(
                     bad_request("invalid Accept-Encoding"),
                 )?;
-                if key.trim() != "q" {
+                if !key.trim().eq_ignore_ascii_case("q") {
                     return Result::Err(bad_request("invalid Accept-Encoding parameter"))
                 }
                 encoding_quality(value.trim())?
