@@ -65,6 +65,12 @@ server.shutdown(Duration::from_seconds(3))?;
 
 `Body::read(maximum)` reads up to 1–65536 bytes and returns an empty buffer at EOF. `collect(limit)` is explicitly bounded. Body implements `std::io::Read` and `Close`; `StreamWriter` implements `std::io::Write`. `io::copy(request.body(), writer)` therefore supports a true streaming echo or transform without buffering the whole body.
 
+A transport, framing or request-body-limit failure is terminal for the shared
+body stream: subsequent reads return the original error, and the connection
+cannot process further requests. Failures known before response headers are
+sent also set `Connection: close`. Invalid read sizes and extraction limits do
+not invalidate the transport stream.
+
 `Response::stream(status, content_type, producer)` invokes the producer while the response is active. `StreamWriter::write` buffers through the HTTP transport, `send` writes and flushes, `text` sends UTF-8, and `event` sends an SSE event. Each bespoke write/send/text/event call accepts at most 65536 encoded bytes and returns a configuration error above that bound. The standard `io::Write` implementation uses partial writes of at most 65536 bytes, so `write_all`/`copy` handle larger input.
 
 Streaming sends headers before invoking the producer, including when the producer has not yet emitted an event. Writes execute synchronously against the TCP stream; a slow receiver blocks the producer instead of growing a background output queue. Request bodies remain readable while streaming a response. The input reader uses 16 KiB reads and one queued chunk, and the operating system retains its own bounded buffers. HTTP/1.1 streams use chunked framing; HTTP/1.0 streams finish by closing the connection.

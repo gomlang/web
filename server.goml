@@ -494,7 +494,8 @@ fn serve_request(
         return false
     }
     let chunked = response.stream_value.is_some() && head.method != "HEAD" && head.http11;
-    let close = head.close || closing || response.stream_value.is_some() && !head.http11;
+    let close = head.close || closing || body.has_failed()
+        || response.stream_value.is_some() && !head.http11;
     if socket_write(stream, context, response_head(response, chunked, close)).is_err() {
         return false
     }

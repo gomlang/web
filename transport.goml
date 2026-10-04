@@ -164,6 +164,7 @@ struct BodyCursor {
     done: bool,
     closed: bool,
     count: isize,
+    failure: Option[Error],
 }
 
 struct BodyState {
@@ -171,6 +172,7 @@ struct BodyState {
     lifetime: Lifetime,
     gate: Channel[()],
     cursor: Ref[BodyCursor],
+    failed: Channel[()],
     limit: isize,
     trailer_limit: isize,
 }
@@ -189,8 +191,10 @@ impl BodyState {
                     done: !chunked && length == 0,
                     closed: false,
                     count: 0,
+                    failure: Option::None,
                 },
             ),
+            failed: Channel::new(0),
             limit: limits.body_bytes,
             trailer_limit: limits.header_bytes,
         }
@@ -205,6 +209,26 @@ impl BodyState {
         self.lifetime.acquire(self.gate)?;
         defer self.gate.send(());
         self.lifetime.check()?;
+        if let Some(error) = self.cursor.get().failure {
+            return Result::Err(error)
+        }
+        let result = self.read_inner(maximum);
+        if let Err(error) = result {
+            self.cursor.set(BodyCursor { failure: Option::Some(error), ..self.cursor.get() });
+            self.failed.close();
+        }
+        result
+    }
+
+    fn has_failed(self: BodyState) -> bool {
+        // Inspect failure without waiting for a concurrent body read to finish.
+        select {
+            recv(self.failed) as _ => true,
+            default => false,
+        }
+    }
+
+    fn read_inner(self: BodyState, maximum: isize) -> Result[Bytes, Error] {
         let mut cursor = self.cursor.get();
         if cursor.closed {
             return Result::Err(closed_error())
