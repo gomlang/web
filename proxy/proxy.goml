@@ -83,7 +83,7 @@ impl Proxy {
         outbound = outbound.header("x-forwarded-for", remote.ip.to_string()).header(
             "x-forwarded-host",
             incoming.host()?,
-        ).header("x-forwarded-proto", "http");
+        ).header("x-forwarded-proto", incoming.scheme());
         let received = match outbound.send_with(incoming.context()) {
             Ok(value) => value,
             Err(error) => return Result::Ok(

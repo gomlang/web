@@ -1,0 +1,23 @@
+package tests;
+
+use ecosystem::web::{Router, Headers, Response};
+use std::bytes::{Bytes};
+use std::testing;
+
+#[test]
+fn dispatched_request_scheme_ignores_forwarding_headers() -> () {
+    let router = Router::new().get("/", |request| Result::Ok(Response::text(200, request.scheme())));
+    let headers = testing::expect_ok(
+        Headers::new().insert("x-forwarded-proto", "https"),
+        "spoofed scheme",
+    );
+    let headers = testing::expect_ok(
+        headers.insert("forwarded", "proto=https"),
+        "spoofed Forwarded",
+    );
+    let response = testing::expect_ok(
+        router.dispatch("GET", "/", headers, Bytes::new()),
+        "dispatch",
+    );
+    testing::assert_eq(testing::expect_ok(response.text(), "scheme"), "http");
+}

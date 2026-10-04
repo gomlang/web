@@ -477,7 +477,11 @@ fn serve_request(
         }
     }
     let body = BodyState::new(input, lifetime, head.length, head.chunked, limits);
-    let request = make_request(head, body, lifetime, remote, limits);
+    let scheme = match stream {
+        ConnectionStream::Tcp(_) => "http",
+        ConnectionStream::Tls(_, _) => "https",
+    };
+    let request = make_request(head, body, lifetime, remote, scheme, limits);
     let response = match response_for(router, request) {
         Ok(response) => response,
         Err(error) => {

@@ -58,7 +58,7 @@ server.shutdown(Duration::from_seconds(3))?;
 
 ## Typed requests and responses
 
-`Request` exposes method, escaped path, raw query, headers, path parameters, remote address, host, body, cancellation checks and cancellation-aware waits. `Headers` is an immutable builder with case-insensitive names, duplicate preservation, injection validation and copied entry snapshots.
+`Request` exposes method, escaped path, raw query, headers, path parameters, remote address, host, body, cancellation checks and cancellation-aware waits. `Request::scheme()` reports `http` or `https` from the inbound transport, independent of forwarding headers; dispatch/recording uses `http`. `Headers` is an immutable builder with case-insensitive names, duplicate preservation, injection validation and copied entry snapshots.
 
 `json[T: Deserialize]` accepts `application/json` and `application/*+json` with optional parameters. Missing or incompatible content type produces 415; invalid typed data produces 422. JSON output uses `Response::json[T: Serialize]`. Binary bytes, text, HTML, redirects, custom status and repeated response headers are also supported. HTML output accepts already prepared HTML and does not perform template escaping.
 

@@ -429,13 +429,21 @@ fn read_head(input: Input, limits: Limits) -> Result[Head, Error] {
     )
 }
 
-fn make_request(head: Head, body: BodyState, lifetime: Lifetime, remote: string, limits: Limits) -> Request {
+fn make_request(
+    head: Head,
+    body: BodyState,
+    lifetime: Lifetime,
+    remote: string,
+    scheme: string,
+    limits: Limits,
+) -> Request {
     Request {
         http11_value: head.http11,
         lifetime,
         body_value: Body { state: body },
         remote_value: remote,
         host_value: head.host,
+        scheme_value: scheme,
         method_value: head.method,
         path_value: head.path,
         query_value: head.query,
@@ -583,7 +591,7 @@ fn dispatch(router: Router, method: string, target: string, headers: Headers, bo
                 cursor: Ref::new(InputCursor { data: body.copy(), offset: 0 }),
             };
             let state = BodyState::new(input, lifetime, body.len(), false, limits);
-            let request = make_request(head, state, lifetime, "", limits);
+            let request = make_request(head, state, lifetime, "", "http", limits);
             let response = response_for(router, request)?;
             if response.upgrade_value.is_some() {
                 return Result::Err(

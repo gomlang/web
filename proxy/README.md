@@ -26,8 +26,9 @@ cancels the outbound exchange on disconnect or deadline.
 Hop-by-hop headers, including names nominated by `Connection`, are removed on
 both legs. The proxy does not forward an incoming `Forwarded` or
 `X-Forwarded-*` value. It sets `X-Forwarded-For` from the connected peer,
-`X-Forwarded-Host` from the inbound Host and `X-Forwarded-Proto` to `http`,
-which matches the current plain-HTTP web server. Host and framing headers are
+`X-Forwarded-Host` from the inbound Host and `X-Forwarded-Proto` from the actual
+inbound transport: `http` for TCP and `https` for a TLS listener. Client-supplied
+forwarding headers do not determine this scheme. Host and framing headers are
 recreated by the respective transports. This API does not support WebSocket
 upgrades, CONNECT tunnels, trailers, streaming bodies or informational
 responses; those require transport capabilities beyond buffered handlers.

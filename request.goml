@@ -162,6 +162,7 @@ pub struct Request {
     body_value: Body,
     remote_value: string,
     host_value: string,
+    scheme_value: string,
     method_value: string,
     path_value: string,
     query_value: string,
@@ -200,6 +201,10 @@ impl Request {
 
     pub fn host(self: Request) -> Result[string, Error] {
         Result::Ok(self.host_value)
+    }
+
+    pub fn scheme(self: Request) -> string {
+        self.scheme_value
     }
 
     pub fn body(self: Request) -> Body {

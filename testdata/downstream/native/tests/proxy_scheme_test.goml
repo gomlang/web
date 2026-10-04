@@ -1,0 +1,69 @@
+package tests;
+
+use ecosystem::request;
+use ecosystem::web;
+use ecosystem::web::proxy;
+use ecosystem::web::testing::{TestServer};
+use std::bytes::{Bytes};
+use std::ffi;
+use std::testing;
+use std::time::{Duration};
+
+#[test]
+fn tls_reverse_proxy_forwards_the_transport_scheme_instead_of_spoofed_headers() -> () {
+    let backend = testing::expect_ok(
+        TestServer::start(
+            web::Router::new().fallback(
+                |incoming| Result::Ok(
+                    web::Response::text(
+                        200,
+                        incoming.headers().get("x-forwarded-proto").unwrap_or("missing"),
+                    ),
+                ),
+            ),
+        ),
+        "backend",
+    );
+    defer {
+        let _ = backend.shutdown(Duration::from_seconds(2));
+    };
+    let outbound = testing::expect_ok(request::Client::new(), "proxy client");
+    defer outbound.close();
+    let forwarding = testing::expect_ok(
+        proxy::Proxy::new(backend.base_url(), outbound, 1024, 1024),
+        "proxy",
+    );
+    let (certificate, key, error) = test_certificate();
+    testing::assert(ffi::error_is_nil(error));
+    let certificate = Bytes::from_vec(ffi::slice_to_vec_copy(certificate));
+    let key = Bytes::from_vec(ffi::slice_to_vec_copy(key));
+    let frontend = testing::expect_ok(
+        web::Router::new().fallback(forwarding.handler()).serve_tls(
+            "127.0.0.1:0",
+            web::TlsConfig::new(certificate, key),
+        ),
+        "TLS proxy frontend",
+    );
+    defer {
+        let _ = frontend.shutdown(Duration::from_seconds(2));
+    };
+    let client = testing::expect_ok(
+        request::Client::builder().add_root_certificate(
+            string_from_utf8(certificate.to_vec_copy()).1,
+        ).build(),
+        "trusted client",
+    );
+    defer client.close();
+    let origin = "https://" + testing::expect_ok(frontend.address(), "frontend address");
+    for spoofed in["http", "attacker"] {
+        let response = testing::expect_ok(
+            client.get(origin + "/secure").header("x-forwarded-proto", spoofed).header(
+                "forwarded",
+                "proto=http",
+            ).send(),
+            "proxied TLS response",
+        );
+        testing::assert_eq(response.status().as_isize(), 200);
+        testing::assert_eq(testing::expect_ok(response.text(), "backend scheme"), "https");
+    }
+}

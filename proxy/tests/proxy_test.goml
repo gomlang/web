@@ -58,7 +58,7 @@ fn reverse_proxy_forwards_path_query_body_status_and_safe_headers() -> () {
         client.post(frontend.base_url() + "/child?q=one%20two").text("payload").header(
             "x-forwarded-for",
             "spoofed",
-        ).send(),
+        ).header("x-forwarded-proto", "https").send(),
         "proxied response",
     );
     testing::assert_eq(received.status().as_isize(), 201);
