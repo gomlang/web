@@ -295,7 +295,11 @@ for body limits, response mapping and unsupported upgrade/streaming cases.
 
 ## Scope and verification
 
-The listener serves HTTP/1.1 and HTTP/1.0 over TCP or TLS. HTTP/2 and HTTP/3 remain unsupported. WebSocket upgrade is an explicit response operation; arbitrary connection hijacking is not exposed. Multipart, static files, CORS and buffered gzip compression have the bounds described above.
+The listener serves HTTP/1.1 and HTTP/1.0 over TCP or TLS. Responses with status
+200 and above receive a current UTC `Date` field when no explicit Date was
+supplied, including responses that reject a request before routing. The IMF-fixdate formatter reuses
+`ecosystem::datetime` calendar conversion and preserves forwarded origin dates.
+HTTP/2 and HTTP/3 remain unsupported. WebSocket upgrade is an explicit response operation; arbitrary connection hijacking is not exposed. Multipart, static files, CORS and buffered gzip compression have the bounds described above.
 
 Run from this library repository:
 

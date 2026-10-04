@@ -1,0 +1,45 @@
+package web;
+
+use ecosystem::datetime::{UtcInstant};
+use std::time::{SystemTime};
+
+fn date_two_digits(value: isize) -> string {
+    if value < 10 {
+        "0" + value.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn http_date(now: SystemTime) -> string {
+    let local = UtcInstant::from_unix_nanoseconds(now.unix_nanoseconds()).to_utc();
+    let date = local.date();
+    let time = local.time();
+    let weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let months = [
+        "Jan",
+        "Feb",
+        "Mar",
+        "Apr",
+        "May",
+        "Jun",
+        "Jul",
+        "Aug",
+        "Sep",
+        "Oct",
+        "Nov",
+        "Dec",
+    ];
+    // SystemTime's signed nanosecond range always has a four-digit year.
+    weekdays[date.weekday() - 1] + ", " + date_two_digits(date.day()) + " "
+        + months[date.month() - 1]
+        + " "
+        + date.year().to_string()
+        + " "
+        + date_two_digits(time.hour())
+        + ":"
+        + date_two_digits(time.minute())
+        + ":"
+        + date_two_digits(time.second())
+        + " GMT"
+}

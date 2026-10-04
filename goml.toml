@@ -2,6 +2,7 @@
 path = "ecosystem::web"
 
 [dependencies]
+"ecosystem::datetime" = "0.1.0"
 "ecosystem::websocket" = "0.1.0"
 "ecosystem::compress" = "0.1.0"
 "ecosystem::mime" = "0.1.0"

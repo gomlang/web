@@ -4,7 +4,7 @@ use std::bytes::{Bytes};
 use std::context;
 use std::net;
 use std::net::{TcpListener, TcpStream, SocketAddr, WaitOptions};
-use std::time::{Duration, Timer};
+use std::time::{Duration, Timer, SystemTime};
 
 struct Connection {
     id: isize,
@@ -329,6 +329,9 @@ fn response_head(response: Response, chunked: bool, close: bool) -> Bytes {
         + "\r\n";
     for entry in response.headers_value.entries() {
         value = value + entry.0 + ": " + entry.1 + "\r\n";
+    }
+    if response.headers_value.get("date").is_none() {
+        value += "date: " + http_date(SystemTime::now()) + "\r\n";
     }
     if response.status_value != 204 && response.status_value != 304 {
         value = value

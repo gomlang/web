@@ -1,0 +1,29 @@
+package web;
+
+use std::testing;
+use std::time::{SystemTime};
+
+#[test]
+fn http_date_formats_utc_calendar_fields_as_imf_fixdate() -> () {
+    for (seconds, expected) in[
+        (-1, "Wed, 31 Dec 1969 23:59:59 GMT"),
+        (0, "Thu, 01 Jan 1970 00:00:00 GMT"),
+        (784111777, "Sun, 06 Nov 1994 08:49:37 GMT"),
+        (951868799, "Tue, 29 Feb 2000 23:59:59 GMT"),
+        (1704078245, "Mon, 01 Jan 2024 03:04:05 GMT"),
+        (1706756645, "Thu, 01 Feb 2024 03:04:05 GMT"),
+        (1709262245, "Fri, 01 Mar 2024 03:04:05 GMT"),
+        (1711940645, "Mon, 01 Apr 2024 03:04:05 GMT"),
+        (1714532645, "Wed, 01 May 2024 03:04:05 GMT"),
+        (1717211045, "Sat, 01 Jun 2024 03:04:05 GMT"),
+        (1719803045, "Mon, 01 Jul 2024 03:04:05 GMT"),
+        (1722481445, "Thu, 01 Aug 2024 03:04:05 GMT"),
+        (1725159845, "Sun, 01 Sep 2024 03:04:05 GMT"),
+        (1727751845, "Tue, 01 Oct 2024 03:04:05 GMT"),
+        (1730430245, "Fri, 01 Nov 2024 03:04:05 GMT"),
+        (1733022245, "Sun, 01 Dec 2024 03:04:05 GMT"),
+    ] {
+        let now = testing::expect_ok(SystemTime::checked_from_unix_seconds(seconds), "system time");
+        testing::assert_eq(http_date(now), expected);
+    }
+}

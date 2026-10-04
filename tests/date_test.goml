@@ -1,0 +1,85 @@
+package tests;
+
+use ecosystem::web;
+use ecosystem::request::cookies;
+use std::testing;
+use std::time::{Duration, SystemTime};
+
+fn response_date_field(response: string) -> string {
+    let head = response.split_once("\r\n\r\n").map(|pair| pair.0).unwrap_or(response);
+    let dates: Vec[string] = Vec::new();
+    for line in head.split("\r\n") {
+        if let Some((name, value)) = line.split_once(":") {
+            if name.eq_ignore_ascii_case("date") {
+                dates.push(value.trim());
+            }
+        }
+    }
+    testing::assert_eq(dates.len(), 1);
+    dates[0]
+}
+
+fn assert_recent_response_date(response: string, before: i64) -> () {
+    let value = response_date_field(response);
+    testing::assert_eq(value.byte_len(), 29);
+    testing::assert(value.ends_with(" GMT"));
+    let timestamp = testing::expect_some(cookies::cookie_date(value), "HTTP date");
+    testing::assert(timestamp >= before - 1);
+    testing::assert(timestamp <= SystemTime::now().unix_seconds() + 1);
+}
+
+#[test]
+fn live_response_date_is_generated_for_success_redirect_and_client_errors() -> () {
+    let mut router = web::Router::new();
+    for status in[200, 204, 205, 301, 304, 400, 404] {
+        router = router.get("/" + status.to_string(), |_| Result::Ok(web::Response::new(status)));
+    }
+    let server = transport_server(router);
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+    };
+    for status in[200, 204, 205, 301, 304, 400, 404] {
+        let before = SystemTime::now().unix_seconds();
+        let response = transport_request(
+            server,
+            "GET /" + status.to_string()
+                + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        testing::assert(response.starts_with("HTTP/1.1 " + status.to_string() + " "));
+        assert_recent_response_date(response, before);
+    }
+}
+
+#[test]
+fn live_response_date_is_generated_for_rejected_requests() -> () {
+    let server = transport_server(web::Router::new());
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+    };
+    let before = SystemTime::now().unix_seconds();
+    let response = transport_request(
+        server,
+        "GET / HTTP/1.1\r\nHost: bad<host\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(response.starts_with("HTTP/1.1 400 "));
+    assert_recent_response_date(response, before);
+}
+
+#[test]
+fn live_response_date_preserves_an_explicit_origin_date() -> () {
+    let date = "Sun, 06 Nov 1994 08:49:37 GMT";
+    let server = transport_server(
+        web::Router::new().get(
+            "/",
+            |_| Result::Ok(web::Response::text(200, "ok").header("Date", date)),
+        ),
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+    };
+    let response = transport_request(
+        server,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert_eq(response_date_field(response), date);
+}
