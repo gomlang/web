@@ -1,0 +1,71 @@
+package tests;
+
+use ecosystem::web::{Router, Response};
+use std::testing;
+use std::time::{Duration};
+
+fn chunk_extension_server() -> ecosystem::web::Server {
+    transport_server(
+        Router::new().post(
+            "/",
+            |request| Result::Ok(Response::new(200).body(request.body().collect(16)?)),
+        ),
+    )
+}
+
+fn chunk_extension_request(line: string, ending: string) -> string {
+    "POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        + line
+        + "\r\nok\r\n"
+        + ending
+        + "\r\n\r\n"
+}
+
+#[test]
+fn malformed_request_chunk_extensions_are_rejected() -> () {
+    let server = chunk_extension_server();
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    for extension in[
+        ";",
+        ";name=",
+        ";name=\"unfinished",
+        ";name=bad value",
+        ";name=\u0000",
+        ";name=\u007f",
+        ";name=\"bad\rvalue\"",
+    ] {
+        for last in[false, true] {
+            let response = transport_request(
+                server,
+                if last {
+                    chunk_extension_request("2", "0" + extension)
+                } else {
+                    chunk_extension_request("2" + extension, "0")
+                },
+            );
+            testing::assert(response.starts_with("HTTP/1.1 400 "));
+        }
+    }
+}
+
+#[test]
+fn request_chunk_extensions_accept_rfc_bad_whitespace_positions() -> () {
+    let server = chunk_extension_server();
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    for extension in[
+        " ; name = value",
+        "\t;\tname\t=\t\"a;=b\"",
+        ";name=\"escaped\\\"quote\"; flag",
+    ] {
+        let response = transport_request(
+            server,
+            chunk_extension_request("2" + extension, "0" + extension),
+        );
+        testing::assert(response.starts_with("HTTP/1.1 200 "));
+        testing::assert(response.ends_with("\r\n\r\nok"));
+    }
+}

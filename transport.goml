@@ -1,6 +1,7 @@
 package web;
 
 use ecosystem::textproto;
+use ecosystem::http;
 use std::bytes::{Bytes};
 use std::context;
 use std::io;
@@ -216,8 +217,9 @@ impl BodyState {
                 return Result::Err(bad_request("invalid chunk delimiter"))
             }
             let line = self.input.line(8192)?;
-            let size = line.split_once(";").map(|pair| pair.0).unwrap_or(line);
-            cursor.remaining = parse_size(size, 16)?;
+            cursor.remaining = http::chunk_size(line, 9223372036854775807).map_err(
+                |error| bad_request(error.message),
+            )?.to_isize();
             if cursor.remaining > self.limit - cursor.count {
                 return Result::Err(Error::new(ErrorKind::BodyLimit, "request body exceeds limit"))
             }

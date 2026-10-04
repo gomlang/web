@@ -4,6 +4,11 @@
 
 The design takes inspiration from [Axum](https://docs.rs/axum/latest/axum/). It adapts the handler model to GoML closures and garbage collection, rather than reproducing Rust ownership or async futures. The transport supports HTTP/1.1 keepalive, chunked bodies, pipelined requests and `100 Continue`.
 
+Chunk-size lines validate extension names, values and quoted escapes before
+ignoring extension metadata, including extensions on the final zero chunk.
+Malformed extensions return 400; permitted space/tab around their separators
+is accepted. Chunk lines remain bounded to 8192 bytes.
+
 ## Using the library
 
 Use GoML 0.1.56 or newer. The published toolchain includes the `std::panic` API
