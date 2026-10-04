@@ -39,7 +39,8 @@ fn static_compression_revalidation_preserves_negotiated_metadata() -> () {
     let cached = transport_request(
         server,
         "GET /file.txt HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\nIf-None-Match: "
-            + etag + "\r\nConnection: close\r\n\r\n",
+            + etag
+            + "\r\nConnection: close\r\n\r\n",
     );
     testing::assert(cached.starts_with("HTTP/1.1 304 "));
     testing::assert(cached.contains("etag: " + etag + "\r\n"));
@@ -49,7 +50,8 @@ fn static_compression_revalidation_preserves_negotiated_metadata() -> () {
     let partial = transport_request(
         server,
         "GET /file.txt HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\nRange: bytes=2-4\r\nIf-Range: "
-            + etag.byte_slice(2, etag.byte_len()) + "\r\nConnection: close\r\n\r\n",
+            + etag.byte_slice(2, etag.byte_len())
+            + "\r\nConnection: close\r\n\r\n",
     );
     testing::assert(partial.starts_with("HTTP/1.1 206 "));
     testing::assert(partial.contains("content-range: bytes 2-4/10\r\n"));
@@ -58,7 +60,8 @@ fn static_compression_revalidation_preserves_negotiated_metadata() -> () {
     let rejected = transport_request(
         server,
         "GET /file.txt HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: *;q=0\r\nIf-None-Match: "
-            + etag + "\r\nConnection: close\r\n\r\n",
+            + etag
+            + "\r\nConnection: close\r\n\r\n",
     );
     testing::assert(rejected.starts_with("HTTP/1.1 406 "));
 }
