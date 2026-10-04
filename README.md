@@ -9,6 +9,11 @@ ignoring extension metadata, including extensions on the final zero chunk.
 Malformed extensions return 400; permitted space/tab around their separators
 is accepted. Chunk lines remain bounded to 8192 bytes.
 
+Host fields validate the authority syntax before dispatch, including IP-literal
+brackets, percent escapes and decimal ports. Invalid fields return 400 and
+close the connection. Accepted host spelling is preserved for handlers; HTTP/1.0
+requests can still omit Host.
+
 ## Using the library
 
 Use GoML 0.1.56 or newer. The published toolchain includes the `std::panic` API

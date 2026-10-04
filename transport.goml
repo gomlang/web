@@ -6,6 +6,7 @@ use std::bytes::{Bytes};
 use std::context;
 use std::io;
 use std::net::{TcpStream, WaitOptions};
+use std::net::url;
 use std::panic;
 
 fn context_error(error: context::Error) -> Error {
@@ -369,6 +370,14 @@ fn read_head(input: Input, limits: Limits) -> Result[Head, Error] {
     for byte in host.to_bytes() {
         if byte <= 32 || byte == 127 || byte == b'/' || byte == b'\\' || byte == b'@' {
             return Result::Err(bad_request("invalid Host header"))
+        }
+    }
+    if host != "" {
+        let authority = url::Authority::parse(host, host.byte_len()).map_err(
+            |_| bad_request("invalid Host header"),
+        )?;
+        if authority.raw_host() == "" {
+            return Result::Err(bad_request("empty host in Host header"))
         }
     }
     let lengths = headers.get_all("content-length");

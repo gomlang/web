@@ -1,0 +1,78 @@
+package tests;
+
+use ecosystem::web::{Router, Response};
+use std::testing;
+use std::time::{Duration};
+
+#[test]
+fn malformed_host_authorities_are_rejected_before_dispatch() -> () {
+    let entered = Channel::new(1);
+    let server = transport_server(
+        Router::new().get(
+            "/",
+            |_| {
+                entered.send(());
+                Result::Ok(Response::text(200, "unexpected handler"))
+            },
+        ),
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    for host in[
+        "example.com?query",
+        "example.com#fragment",
+        "example.com:port",
+        "example.com:80:90",
+        "[::1",
+        "[invalid]",
+        "::1",
+        "ex%GG.test",
+        ":80",
+        "[]:80",
+    ] {
+        let response = transport_request(
+            server,
+            "GET / HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n",
+        );
+        testing::assert(response.starts_with("HTTP/1.1 400 "));
+        testing::assert(response.to_ascii_lowercase().contains("connection: close\r\n"));
+        let called = select {
+            recv(entered) as _ => true,
+            default => false,
+        };
+        testing::assert(!called);
+    }
+}
+
+#[test]
+fn valid_host_authorities_preserve_their_received_spelling() -> () {
+    let server = transport_server(
+        Router::new().get(
+            "/",
+            |request| {
+                Result::Ok(Response::text(200, request.host()?))
+            },
+        ),
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    for host in[
+        "localhost",
+        "EXAMPLE.com:080",
+        "example.com:",
+        "127.0.0.1:0",
+        "[::1]:443",
+        "[2001:db8::1]",
+        "[v1.future]",
+        "ex%61mple.test",
+    ] {
+        let response = transport_request(
+            server,
+            "GET / HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n",
+        );
+        testing::assert(response.starts_with("HTTP/1.1 200 "));
+        testing::assert(response.ends_with("\r\n\r\n" + host));
+    }
+}
