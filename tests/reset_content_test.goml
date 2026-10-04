@@ -1,0 +1,72 @@
+package tests;
+
+use ecosystem::web;
+use std::bytes::{Bytes};
+use std::testing;
+use std::time::{Duration};
+
+#[test]
+fn reset_content_rejects_buffered_and_streamed_content() -> () {
+    testing::assert_ok(web::Response::new(205).validate());
+    testing::assert_eq(
+        testing::expect_err(web::Response::text(205, "payload").validate(), "205 body").kind,
+        web::ErrorKind::Configuration,
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            web::Response::stream(205, "text/plain", |writer| writer.text("payload")).validate(),
+            "205 stream",
+        ).kind,
+        web::ErrorKind::Configuration,
+    );
+}
+
+#[test]
+fn reset_content_compression_preserves_empty_responses() -> () {
+    let router = web::Router::new().get("/", |_| Result::Ok(web::Response::new(205))).layer(
+        testing::expect_ok(web::compression(1024), "compression"),
+    );
+    for method in["GET", "HEAD"] {
+        for encoding in["gzip", "gzip, identity;q=0", "gzip;q=0, identity;q=0", "*;q=0"] {
+            let response = extras_dispatch(
+                router,
+                method,
+                "/",
+                extras_header(web::Headers::new(), "accept-encoding", encoding),
+                Bytes::new(),
+            );
+            testing::assert_eq(response.status, 205);
+            testing::assert_eq(response.bytes().len(), 0);
+            testing::assert(response.headers.get("content-encoding").is_none());
+        }
+    }
+}
+
+#[test]
+fn reset_content_tcp_uses_zero_length_framing_before_the_next_response() -> () {
+    let router = web::Router::new().get("/reset", |_| Result::Ok(web::Response::new(205))).get(
+        "/next",
+        |_| Result::Ok(web::Response::text(200, "next")),
+    ).layer(testing::expect_ok(web::compression(1024), "compression"));
+    let server = transport_server(router);
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+    };
+    let stream = transport_connect(server);
+    defer {
+        let _ = stream.close();
+    };
+    transport_send(
+        stream,
+        "GET /reset HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\n\r\n"
+            + "GET /next HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    let reset = transport_head(stream).to_ascii_lowercase();
+    testing::assert(reset.starts_with("http/1.1 205 "));
+    testing::assert(reset.contains("content-length: 0\r\n"));
+    testing::assert(!reset.contains("content-encoding:"));
+    testing::assert(!reset.contains("transfer-encoding:"));
+    let next = transport_head(stream);
+    testing::assert(next.starts_with("HTTP/1.1 200 "));
+    testing::assert_eq(transport_closed(stream), "next");
+}

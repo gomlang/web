@@ -114,8 +114,9 @@ pub fn compression(max_bytes: isize) -> Result[Middleware, Error] {
                 return Result::Ok(response)
             }
             let response = vary_header(response, "Accept-Encoding");
-            let eligible = response.status() != 204 && response.status() != 304
-                && response.status() != 206
+            let forbids_content = response.status() == 204 || response.status() == 205
+                || response.status() == 304;
+            let eligible = !forbids_content && response.status() != 206
                 && response.stream_value.is_none()
                 && response.bytes_value.len() <= max_bytes
                 && !no_transform(response.headers())
@@ -123,7 +124,7 @@ pub fn compression(max_bytes: isize) -> Result[Middleware, Error] {
                 && response.headers().get("content-range").is_none();
             if !eligible || gzip_quality == 0 || gzip_quality < identity_quality {
                 return Result::Ok(
-                    if identity_quality == 0 && response.status() != 204 && response.status() != 304 {
+                    if identity_quality == 0 && !forbids_content {
                         vary_header(
                             Response::text(406, "no acceptable content encoding"),
                             "Accept-Encoding",

@@ -141,6 +141,9 @@ encoded bytes ([RFC 9530](https://www.rfc-editor.org/rfc/rfc9530.html)); respons
 that are not transformed keep their digest fields. Existing encodings, range
 responses, upgrades, streams/SSE and `Cache-Control: no-transform` remain outside
 compression. If no available representation is acceptable it returns 406.
+Statuses 204, 205 and 304 keep empty bodies regardless of encoding preferences;
+response validation rejects buffered content and stream producers for these
+statuses. A 205 response retains ordinary `Content-Length: 0` framing.
 Streaming responses retain their existing bounded transport behavior.
 
 ## Sessions, CSRF and rate limiting
