@@ -16,8 +16,8 @@ fn io_error(error: Error, operation: string) -> io::Error {
     io::Error::new(kind, operation, Option::None, Option::None, error.message)
 }
 
-impl io::Read for Body {
-    fn read(self: Body, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+impl Body {
+    fn read_into(self: Body, buffer: MutSlice[byte]) -> Result[isize, Error] {
         if buffer.len() == 0 {
             return Result::Ok(0)
         }
@@ -26,11 +26,17 @@ impl io::Read for Body {
         } else {
             buffer.len()
         };
-        let chunk = Body::read(self, count).map_err(|error| io_error(error, "read HTTP request"))?;
+        let chunk = Body::read(self, count)?;
         for i in 0..chunk.len() {
             buffer[i] = chunk.as_slice()[i];
         }
         Result::Ok(chunk.len())
+    }
+}
+
+impl io::Read for Body {
+    fn read(self: Body, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.read_into(buffer).map_err(|error| io_error(error, "read HTTP request"))
     }
 }
 

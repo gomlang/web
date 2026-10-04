@@ -1,0 +1,60 @@
+package tests;
+
+use ecosystem::web::{Router, Response, Error, ErrorKind, Limits};
+use ecosystem::mime::multipart;
+use std::testing;
+use std::time::{Duration};
+
+fn multipart_source_statuses(mode: isize) -> () {
+    let server = transport_server(
+        Router::new().post(
+            "/",
+            |request| {
+                let form = request.multipart(multipart::Limits::standard())?;
+                let field = form.next_field()?.ok_or(
+                    Error::new(ErrorKind::BadRequest, "missing field"),
+                )?;
+                if mode == 1 {
+                    let _ = field.collect(64)?;
+                } else if mode == 2 {
+                    let _ = form.next_field()?;
+                }
+                Result::Ok(Response::text(200, "read upload"))
+            },
+        ).limits(Limits { body_bytes: 64, ..Limits::new() }),
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    let prefix = if mode == 0 {
+        ""
+    } else {
+        "31\r\n--b\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\n\r\n"
+    };
+    let statuses = Vec::new();
+    for chunk in["z\r\n", "100\r\n"] {
+        let response = transport_request(
+            server,
+            "POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Type: multipart/form-data; boundary=b\r\nConnection: close\r\n\r\n"
+                + prefix
+                + chunk,
+        );
+        statuses.push(response.split("\r\n")[0].split(" ")[1]);
+    }
+    testing::assert_eq(statuses.join(","), "400,413");
+}
+
+#[test]
+fn multipart_preserves_body_errors_while_reading_part_headers() -> () {
+    multipart_source_statuses(0);
+}
+
+#[test]
+fn multipart_preserves_body_errors_while_reading_field_bytes() -> () {
+    multipart_source_statuses(1);
+}
+
+#[test]
+fn multipart_preserves_body_errors_while_discarding_unread_fields() -> () {
+    multipart_source_statuses(2);
+}

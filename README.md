@@ -89,6 +89,8 @@ A request remains active until its response producer finishes. Body/request/writ
 `request.multipart(ecosystem::mime::multipart::Limits::standard())` opens a bounded, incremental form-data reader. Call `next_field()` for each field; its public metadata includes `name`, optional `filename`, optional `content_type`, and headers. `field.read(maximum)` reads at most 65536 bytes, while `field.collect(limit)` explicitly buffers a bounded field. Moving to the next field drains unread data under the same limits and invalidates the previous handle. Handles also expire when the request ends. Filenames are metadata; applications choose their own storage names and paths.
 
 Declare `ecosystem::mime` as a direct dependency when configuring multipart limits. Part count, header sizes, individual part bytes and total bytes have independent limits in addition to the router's request-body limit. Invalid dispositions and transfer encodings return 400; exceeded multipart limits return 413. The reader does not write temporary files.
+Request-body framing errors retain 400 and the router's body limit retains 413
+while reading multipart headers, reading a field or discarding an unread field.
 
 ## Static files and middleware
 

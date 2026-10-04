@@ -3,9 +3,28 @@ package web;
 use ecosystem::mime;
 use ecosystem::mime::multipart;
 use std::bytes::{Bytes};
+use std::io;
+
+struct MultipartSource {
+    body: Body,
+    failure: Ref[Option[Error]],
+}
+
+impl io::Read for MultipartSource {
+    fn read(self: MultipartSource, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.body.read_into(output).map_err(
+            |error| {
+                // Multipart's gate serializes access to the reader and this error slot.
+                self.failure.set(Option::Some(error));
+                io_error(error, "read HTTP multipart request")
+            },
+        )
+    }
+}
 
 pub struct Multipart {
-    reader: multipart::Reader[Body],
+    reader: multipart::Reader[MultipartSource],
+    source: MultipartSource,
     lifetime: Lifetime,
     gate: Channel[()],
     generation: Ref[isize],
@@ -55,12 +74,14 @@ impl Request {
         let boundary = media.parameter("boundary").ok_or(
             bad_request("multipart boundary is missing"),
         )?;
-        let reader = multipart::Reader::new(self.body(), boundary, limits).map_err(multipart_error)?;
+        let source = MultipartSource { body: self.body(), failure: Ref::new(Option::None) };
+        let reader = multipart::Reader::new(source, boundary, limits).map_err(multipart_error)?;
         let gate = Channel::new(1);
         gate.send(());
         Result::Ok(
             Multipart {
                 reader,
+                source,
                 lifetime: self.lifetime,
                 gate,
                 generation: Ref::new(0),
@@ -71,6 +92,15 @@ impl Request {
 }
 
 impl Multipart {
+    fn error(self: Multipart, error: multipart::Error) -> Error {
+        if error.cause.is_some() {
+            if let Some(original) = self.source.failure.get() {
+                return original
+            }
+        }
+        multipart_error(error)
+    }
+
     pub fn next_field(self: Multipart) -> Result[Option[MultipartField], Error] {
         self.lifetime.acquire(self.gate)?;
         defer self.gate.send(());
@@ -80,13 +110,16 @@ impl Multipart {
             for _ in 0..16384 {
                 buffer.push(0);
             }
-            while self.reader.read_body_chunk(buffer.as_mut_slice()).map_err(multipart_error)? != 0 {
+            while self.reader.read_body_chunk(buffer.as_mut_slice()).map_err(
+                |error| self.error(error),
+            )?
+                != 0 {
                 self.lifetime.check()?;
             }
         }
         self.active.set(false);
         self.generation.set(self.generation.get() + 1);
-        let Some(raw) = self.reader.next_part().map_err(multipart_error)? else {
+        let Some(raw) = self.reader.next_part().map_err(|error| self.error(error))? else {
             return Result::Ok(Option::None)
         };
         self.active.set(true);
@@ -148,7 +181,7 @@ impl MultipartField {
             buffer.push(0);
         }
         let count = self.parent.reader.read_body_chunk(buffer.as_mut_slice()).map_err(
-            multipart_error,
+            |error| self.parent.error(error),
         )?;
         if count == 0 {
             self.parent.active.set(false);
