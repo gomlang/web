@@ -1,0 +1,60 @@
+package tests;
+
+use ecosystem::web;
+use std::bytes::{Bytes};
+use std::testing;
+
+fn digest_response() -> web::Response {
+    // SHA-256 of the unencoded five-byte body.
+    let digest = "sha-256=:LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=:";
+    web::Response::text(200, "hello").header("content-digest", digest).header("repr-digest", digest)
+}
+
+#[test]
+fn compression_removes_digests_of_the_unencoded_response() -> () {
+    let router = web::Router::new().get("/", |_| Result::Ok(digest_response())).layer(
+        testing::expect_ok(web::compression(1024), "compression"),
+    );
+    let response = extras_dispatch(
+        router,
+        "GET",
+        "/",
+        extras_header(web::Headers::new(), "accept-encoding", "gzip"),
+        Bytes::new(),
+    );
+    testing::assert_eq(response.status, 200);
+    testing::assert_eq(response.headers.get("content-encoding").unwrap_or(""), "gzip");
+    let stale = Vec::new();
+    for name in["content-digest", "repr-digest"] {
+        if response.headers.get(name).is_some() {
+            stale.push(name);
+        }
+    }
+    testing::assert_eq(stale.join(","), "");
+}
+
+#[test]
+fn compression_preserves_digests_when_the_response_is_not_transformed() -> () {
+    let router = web::Router::new().get("/", |_| Result::Ok(digest_response())).get(
+        "/fixed",
+        |_| Result::Ok(digest_response().header("cache-control", "no-transform")),
+    ).layer(testing::expect_ok(web::compression(1024), "compression"));
+    for (path, encoding) in[("/", "identity"), ("/fixed", "gzip")] {
+        let response = extras_dispatch(
+            router,
+            "GET",
+            path,
+            extras_header(web::Headers::new(), "accept-encoding", encoding),
+            Bytes::new(),
+        );
+        testing::assert_eq(response.status, 200);
+        testing::assert_eq(testing::expect_ok(response.text(), "unencoded response"), "hello");
+        testing::assert(response.headers.get("content-encoding").is_none());
+        for name in["content-digest", "repr-digest"] {
+            testing::assert_eq(
+                response.headers.get(name).unwrap_or(""),
+                digest_response().headers().get(name).unwrap_or(""),
+            );
+        }
+    }
+}

@@ -144,7 +144,9 @@ pub fn compression(max_bytes: isize) -> Result[Middleware, Error] {
             )?;
             let mut response = response.body(encoded).header("content-encoding", "gzip");
             response = Response {
-                headers_value: response.headers().remove("content-md5").remove("digest"),
+                headers_value: response.headers().remove("content-md5").remove("digest").remove(
+                    "content-digest",
+                ).remove("repr-digest"),
                 ..response,
             };
             if let Some(etag) = response.headers().get("etag") {
