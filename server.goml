@@ -324,33 +324,39 @@ fn status_text(status: isize) -> string {
 }
 
 fn response_head(response: Response, chunked: bool, close: bool) -> Bytes {
-    let mut value = "HTTP/1.1 " + response.status_value.to_string() + " "
-        + status_text(response.status_value)
-        + "\r\n";
+    let value = Bytes::from_string(
+        "HTTP/1.1 " + response.status_value.to_string() + " " + status_text(response.status_value)
+            + "\r\n",
+    );
     for entry in response.headers_value.entries() {
-        value = value + entry.0 + ": " + entry.1 + "\r\n";
+        value.extend_from_slice(entry.0.to_bytes().as_slice());
+        value.extend_from_slice(b": ".as_slice());
+        value.extend_from_slice(entry.1.to_bytes().as_slice());
+        value.extend_from_slice(b"\r\n".as_slice());
     }
     if response.headers_value.get("date").is_none() {
-        value += "date: " + http_date(SystemTime::now()) + "\r\n";
+        value.extend_from_slice(
+            ("date: " + http_date(SystemTime::now()) + "\r\n").to_bytes().as_slice(),
+        );
     }
     if response.status_value != 204 && response.status_value != 304 {
-        value = value
-            + if chunked {
-                "transfer-encoding: chunked\r\n"
-            } else if response.stream_value.is_none() {
-                "content-length: " + response.bytes_value.len().to_string() + "\r\n"
-            } else {
-                ""
-            };
+        let framing = if chunked {
+            "transfer-encoding: chunked\r\n"
+        } else if response.stream_value.is_none() {
+            "content-length: " + response.bytes_value.len().to_string() + "\r\n"
+        } else {
+            ""
+        };
+        value.extend_from_slice(framing.to_bytes().as_slice());
     }
-    Bytes::from_string(
-        value
-            + if close {
-                "connection: close\r\n\r\n"
-            } else {
-                "connection: keep-alive\r\n\r\n"
-            },
-    )
+    value.extend_from_slice(
+        if close {
+            b"connection: close\r\n\r\n".as_slice()
+        } else {
+            b"connection: keep-alive\r\n\r\n".as_slice()
+        },
+    );
+    value
 }
 
 fn send_busy(stream: ConnectionStream) -> () {

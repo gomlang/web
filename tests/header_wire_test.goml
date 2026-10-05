@@ -1,0 +1,116 @@
+package tests;
+
+use ecosystem::web;
+use std::bytes::{Bytes};
+use std::testing;
+use std::time::{Duration};
+
+#[test]
+fn response_header_wire_preserves_large_fields_and_stream_framing() -> () {
+    let date = "Mon, 05 Oct 2026 00:00:00 GMT";
+    for streaming in[false, true] {
+        for many in[false, true] {
+            let mut response = if streaming {
+                web::Response::stream(200, "text/plain", |writer| writer.text("ok"))
+            } else {
+                web::Response::new(200).body(Bytes::from_string("ok"))
+            };
+            let mut fields = if streaming {
+                "content-type: text/plain\r\n"
+            } else {
+                ""
+            };
+            response = response.header("Date", date).append_header("Set-Cookie", "a=1").append_header(
+                "set-cookie",
+                "b=2",
+            ).header("X-Empty", "").header("X-Unicode", "中\t😀");
+            fields += "date: " + date
+                + "\r\nset-cookie: a=1\r\nset-cookie: b=2\r\nx-empty: \r\nx-unicode: 中\t😀\r\n";
+            if many {
+                let value = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-_";
+                for index in 0..128 {
+                    let name = "x-field-" + index.to_string();
+                    response = response.header(name, value);
+                    fields += name + ": " + value + "\r\n";
+                }
+            } else {
+                let mut value = "";
+                for _ in 0..8192 {
+                    value += "é";
+                }
+                response = response.header("x-large", value);
+                fields += "x-large: " + value + "\r\n";
+            }
+            let server = transport_server(web::Router::new().get("/", |_| Result::Ok(response)));
+            defer {
+                let _ = server.shutdown(Duration::from_seconds(1));
+            };
+            for version in["HTTP/1.0", "HTTP/1.1"] {
+                for method in["GET", "HEAD"] {
+                    let chunked = streaming && method == "GET" && version == "HTTP/1.1";
+                    let framing = if chunked {
+                        "transfer-encoding: chunked\r\n"
+                    } else if !streaming {
+                        "content-length: 2\r\n"
+                    } else {
+                        ""
+                    };
+                    let body = if method == "HEAD" {
+                        ""
+                    } else if chunked {
+                        "2\r\nok\r\n0\r\n\r\n"
+                    } else {
+                        "ok"
+                    };
+                    let wire = transport_request(
+                        server,
+                        method + " / " + version
+                            + "\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    );
+                    testing::assert_eq(
+                        wire,
+                        "HTTP/1.1 200 OK\r\n" + fields + framing + "connection: close\r\n\r\n"
+                            + body,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn response_header_wire_preserves_explicit_dates_and_empty_status_boundaries() -> () {
+    let date = "Mon, 05 Oct 2026 00:00:00 GMT";
+    let earlier = "Sun, 04 Oct 2026 00:00:00 GMT";
+    let router = web::Router::new().get(
+        "/empty",
+        |_| Result::Ok(web::Response::new(204).header("Date", "")),
+    ).get(
+        "/cached",
+        |_| Result::Ok(
+            web::Response::new(304).append_header("Date", date).append_header("date", earlier),
+        ),
+    ).get("/reset", |_| Result::Ok(web::Response::new(205).header("Date", date)));
+    let server = transport_server(router);
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+    };
+    let wire = transport_request(
+        server,
+        "GET /empty HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            + "HEAD /cached HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            + "GET /reset HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert_eq(
+        wire,
+        "HTTP/1.1 204 No Content\r\ndate: \r\nconnection: keep-alive\r\n\r\n"
+            + "HTTP/1.1 304 Not Modified\r\ndate: "
+            + date
+            + "\r\ndate: "
+            + earlier
+            + "\r\nconnection: keep-alive\r\n\r\n"
+            + "HTTP/1.1 205 Response\r\ndate: "
+            + date
+            + "\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+    );
+}
