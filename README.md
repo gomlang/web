@@ -16,14 +16,14 @@ requests can still omit Host.
 
 ## Using the library
 
-Use GoML 0.1.56 or newer. The published toolchain includes the `std::panic` API
+Use [the pinned ecosystem toolchain](https://github.com/gomlang/verification/blob/main/ci/toolchain.json), with unversioned registry support and the `std::panic` API
 and panic-safe lexical cleanup required by handler isolation.
 
-Declare a versioned dependency:
+Declare an unversioned registry dependency:
 
 ```toml
 [dependencies]
-"ecosystem::web" = "0.1.0"
+"ecosystem::web" = true
 ```
 
 Consumers supply a minimal `go.mod`, as shown in `testdata/downstream/native/go.mod`. They do not need a native dependency declaration or handwritten Go `require` or `replace` entries. The native downstream fixture under `testdata/downstream/native` exercises the dependency boundary.
@@ -381,11 +381,11 @@ The handler receives the existing WebSocket connection API and a request context
 
 ## Development and downstream checks
 
-Requires GoML 0.1.56 or newer. The independent native fixture is in `testdata/downstream/native/`; it retains a separate manifest and Go module for native dependencies. From the library root, run:
+Requires a current GoML toolchain supporting unversioned registry dependencies; see [the pinned ecosystem toolchain](https://github.com/gomlang/verification/blob/main/ci/toolchain.json). The independent native fixture is in `testdata/downstream/native/`; it retains a separate manifest and Go module for native dependencies. From the library root, run:
 
 ```sh
 goml test
-goml verify --timeout 300s
+(cd ../verification && just ecosystem-test web)
 ```
 
-`goml verify` builds and tests the fixture against an isolated registry snapshot. `(cd ../verification && just ecosystem-test web)` also runs the library-specific smoke and compatibility checks.
+The ecosystem verifier builds and tests the fixture against an isolated registry snapshot and runs the library-specific smoke and compatibility checks.

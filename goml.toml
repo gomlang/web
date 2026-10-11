@@ -2,13 +2,13 @@
 path = "ecosystem::web"
 
 [dependencies]
-"ecosystem::datetime" = "0.1.0"
-"ecosystem::websocket" = "0.1.0"
-"ecosystem::compress" = "0.1.0"
-"ecosystem::mime" = "0.1.0"
-"ecosystem::http" = "0.1.0"
-"ecosystem::request" = "0.1.0"
-"ecosystem::textproto" = "0.1.0"
+"ecosystem::datetime" = true
+"ecosystem::websocket" = true
+"ecosystem::compress" = true
+"ecosystem::mime" = true
+"ecosystem::http" = true
+"ecosystem::request" = true
+"ecosystem::textproto" = true
 
 [native]
 go-module = "example.com/goml-ecosystem/web"
