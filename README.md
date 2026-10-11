@@ -16,7 +16,7 @@ requests can still omit Host.
 
 ## Using the library
 
-Use [the pinned ecosystem toolchain](https://github.com/gomlang/verification/blob/main/ci/toolchain.json), with unversioned registry support and the `std::panic` API
+Use [the pinned ecosystem toolchain](https://github.com/gomlang/workflows/blob/main/ci/toolchain.json), with unversioned registry support and the `std::panic` API
 and panic-safe lexical cleanup required by handler isolation.
 
 Declare an unversioned registry dependency:
@@ -329,7 +329,7 @@ HTTP/2 and HTTP/3 remain unsupported. WebSocket upgrade is an explicit response 
 Run from this library repository:
 
 ```sh
-(cd ../verification && just ecosystem-test web)
+(cd ../workflows && just ecosystem-test web)
 ```
 
 GoML black-box tests, native downstream tests and cached rebuild checks cover
@@ -381,11 +381,11 @@ The handler receives the existing WebSocket connection API and a request context
 
 ## Development and downstream checks
 
-Requires a current GoML toolchain supporting unversioned registry dependencies; see [the pinned ecosystem toolchain](https://github.com/gomlang/verification/blob/main/ci/toolchain.json). The independent native fixture is in `testdata/downstream/native/`; it retains a separate manifest and Go module for native dependencies. From the library root, run:
+Requires a current GoML toolchain supporting unversioned registry dependencies; see [the pinned ecosystem toolchain](https://github.com/gomlang/workflows/blob/main/ci/toolchain.json). The independent native fixture is in `testdata/downstream/native/`; it retains a separate manifest and Go module for native dependencies. From the library root, run:
 
 ```sh
 goml test
-(cd ../verification && just ecosystem-test web)
+(cd ../workflows && just ecosystem-test web)
 ```
 
 The ecosystem verifier builds and tests the fixture against an isolated registry snapshot and runs the library-specific smoke and compatibility checks.
