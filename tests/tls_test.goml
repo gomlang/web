@@ -1,0 +1,332 @@
+package tests;
+
+use ecosystem::web::{Router, Response, Server, TlsConfig, ErrorKind, Limits};
+use std::bytes::{Bytes};
+use std::context;
+use std::fs;
+use std::net::{SocketAddr};
+use std::net::tls;
+use std::task;
+use std::testing;
+use std::time::{Duration, Instant};
+
+fn tls_certificate() -> Bytes {
+    testing::expect_ok(fs::read_bytes_structured("testdata/tls/certificate.pem"), "TLS certificate")
+}
+
+fn tls_config() -> TlsConfig {
+    TlsConfig::new(
+        tls_certificate(),
+        testing::expect_ok(fs::read_bytes_structured("testdata/tls/private_key.pem"), "TLS key"),
+    )
+}
+
+fn tls_server(router: Router, configuration: TlsConfig) -> Server {
+    testing::expect_ok(router.serve_tls("127.0.0.1:0", configuration), "TLS server")
+}
+
+fn tls_client(server: Server) -> tls::TlsStream {
+    let address = testing::expect_ok(
+        SocketAddr::parse(testing::expect_ok(server.address(), "TLS address")),
+        "TLS socket address",
+    );
+    testing::expect_ok(
+        tls::connect(
+            "127.0.0.1",
+            address.port,
+            tls::ClientConfig::new("localhost").with_ca_pem(tls_certificate().as_slice()).with_alpn(
+                Vec::from_array(["h2", "http/1.1"]),
+            ).with_connect_timeout(Duration::from_seconds(2)),
+        ),
+        "verified TLS connection",
+    )
+}
+
+fn tls_closed(stream: tls::TlsStream, context: context::Context) -> string {
+    let buffer = Vec::from_array([0.to_u8(); 4096]);
+    let result = Vec::new();
+    loop {
+        let count = testing::expect_ok(
+            stream.read_with(buffer.as_mut_slice(), context),
+            "TLS response",
+        );
+        if count == 0 {
+            return string_from_utf8(result).1
+        }
+        result.extend(buffer.slice(0, count).to_vec());
+        testing::assert(result.len() <= 1048576);
+    }
+}
+
+fn tls_request(server: Server, request: string) -> string {
+    let stream = tls_client(server);
+    defer {
+        let _ = stream.close();
+    };
+    context::with_timeout(
+        context::Context::background(),
+        Duration::from_seconds(2),
+        |context, _| {
+            testing::assert_ok(stream.write_all_with(request.to_bytes().as_slice(), context));
+            tls_closed(stream, context)
+        },
+    )
+}
+
+#[test]
+fn tls_listener_echo_negotiates_http11_and_preserves_the_peer_address() -> () {
+    let server = tls_server(
+        Router::new().post(
+            "/",
+            |request| Result::Ok(
+                Response::text(
+                    200,
+                    request.remote_address()? + "|" + request.scheme() + "|" + request.text()?,
+                ),
+            ),
+        ),
+        tls_config().with_minimum_version(tls::Version::Tls13),
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    let client = tls_client(server);
+    defer {
+        let _ = client.close();
+    };
+    let state = testing::expect_ok(client.connection_info(), "TLS state");
+    testing::assert(
+        match state.version {
+            Tls13 => true,
+            _ => false,
+        },
+    );
+    testing::assert_eq(state.negotiated_protocol, "http/1.1");
+    let local = testing::expect_ok(client.local_addr(), "client local address").to_string();
+    context::with_timeout(
+        context::Context::background(),
+        Duration::from_seconds(2),
+        |context, _| {
+            testing::assert_ok(
+                client.write_all_with(
+                    b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nConnection: close\r\n\r\nping".as_slice(),
+                    context,
+                ),
+            );
+            let response = tls_closed(client, context);
+            testing::assert(response.starts_with("HTTP/1.1 200 "));
+            testing::assert(response.ends_with("\r\n\r\n" + local + "|https|ping"));
+        },
+    );
+}
+
+#[test]
+fn tls_stalled_handshake_does_not_block_healthy_clients() -> () {
+    let server = tls_server(
+        Router::new().get("/", |_| Result::Ok(Response::text(200, "ready"))),
+        tls_config().with_handshake_timeout(Duration::from_seconds(10)),
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    let stalled = transport_connect(server);
+    defer {
+        let _ = stalled.close();
+    };
+    let response = tls_request(
+        server,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(response.starts_with("HTTP/1.1 200 "));
+    testing::assert(response.ends_with("\r\n\r\nready"));
+    let before = Instant::now();
+    testing::assert_ok(server.shutdown(Duration::from_seconds(1)));
+    testing::assert(before.elapsed().as_milliseconds() < 1500);
+    testing::assert_eq(transport_closed(stalled), "");
+    testing::assert_ok(server.shutdown(Duration::from_seconds(1)));
+}
+
+#[test]
+fn tls_handshake_deadline_and_invalid_client_leave_the_listener_usable() -> () {
+    let server = tls_server(
+        Router::new().get("/", |_| Result::Ok(Response::text(200, "alive"))),
+        tls_config().with_handshake_timeout(Duration::from_milliseconds(200)),
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    let silent = transport_connect(server);
+    defer {
+        let _ = silent.close();
+    };
+    testing::assert_eq(transport_closed(silent), "");
+    let invalid = transport_connect(server);
+    defer {
+        let _ = invalid.close();
+    };
+    transport_send(invalid, "not a TLS connection\r\n");
+    let _ = transport_closed(invalid);
+    let response = tls_request(
+        server,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(response.ends_with("\r\n\r\nalive"));
+}
+
+#[test]
+fn tls_shutdown_interrupts_idle_and_active_connections() -> () {
+    let entered = Channel::new(1);
+    let finished = Channel::new(1);
+    let server = tls_server(
+        Router::new().get(
+            "/",
+            |request| {
+                entered.send(());
+                let result = request.wait(Duration::from_seconds(10));
+                finished.send(result);
+                Result::Ok(Response::text(200, "done"))
+            },
+        ).limits(Limits { request_timeout: Duration::from_seconds(20), ..Limits::new() }),
+        tls_config(),
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    let idle = tls_client(server);
+    defer {
+        let _ = idle.close();
+    };
+    let active = tls_client(server);
+    defer {
+        let _ = active.close();
+    };
+    testing::assert_ok(
+        active.write_all_with(
+            b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+            context::Context::background(),
+        ),
+    );
+    transport_receive(entered);
+    let before = Instant::now();
+    testing::assert_eq(
+        testing::expect_err(server.shutdown(Duration::from_milliseconds(30)), "forced TLS shutdown").kind,
+        ErrorKind::Timeout,
+    );
+    testing::assert(before.elapsed().as_milliseconds() < 1500);
+    testing::assert_eq(
+        testing::expect_err(transport_receive(finished), "TLS handler cancellation").kind,
+        ErrorKind::Cancelled,
+    );
+    context::with_timeout(
+        context::Context::background(),
+        Duration::from_seconds(2),
+        |context, _| {
+            testing::assert_eq(tls_closed(idle, context), "");
+            testing::assert_eq(tls_closed(active, context), "");
+        },
+    );
+}
+
+#[test]
+fn tls_graceful_shutdown_delivers_the_active_response() -> () {
+    let entered = Channel::new(1);
+    let release = Channel::new(1);
+    let server = tls_server(
+        Router::new().get(
+            "/",
+            |_| {
+                entered.send(());
+                let _ = release.recv();
+                Result::Ok(Response::text(200, "finished"))
+            },
+        ),
+        tls_config(),
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(2));
+    };
+    let client = tls_client(server);
+    defer {
+        let _ = client.close();
+    };
+    testing::assert_ok(
+        client.write_all_with(
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".as_slice(),
+            context::Context::background(),
+        ),
+    );
+    transport_receive(entered);
+    task::scope(
+        |scope| {
+            let shutdown = scope.spawn(|_| server.shutdown(Duration::from_seconds(2)));
+            let before = Instant::now();
+            while !server.is_closed() && before.elapsed().as_milliseconds() < 1000 {
+                testing::assert_ok(
+                    context::Context::background().sleep(Duration::from_milliseconds(1)),
+                );
+            }
+            testing::assert(server.is_closed());
+            release.send(());
+            context::with_timeout(
+                context::Context::background(),
+                Duration::from_seconds(2),
+                |context, _| {
+                    let response = tls_closed(client, context);
+                    testing::assert(response.ends_with("\r\n\r\nfinished"));
+                },
+            );
+            testing::assert_ok(shutdown.join());
+        },
+    );
+}
+
+#[test]
+fn tls_configuration_errors_are_returned_before_binding() -> () {
+    let router = Router::new();
+    testing::assert_eq(
+        testing::expect_err(
+            router.serve_tls("127.0.0.1:0", tls_config().with_handshake_timeout(Duration::zero())),
+            "zero handshake timeout",
+        ).kind,
+        ErrorKind::Configuration,
+    );
+    for config in[
+        TlsConfig::new(Bytes::new(), Bytes::new()),
+        TlsConfig::new(tls_certificate(), Bytes::from_string("invalid key")),
+        TlsConfig::new(Bytes::from_string("invalid certificate"), Bytes::from_string("invalid key")),
+    ] {
+        testing::assert(router.serve_tls("127.0.0.1:0", config).is_err());
+    }
+}
+
+#[test]
+fn tls_minimum_version_controls_tls12_wire_negotiation() -> () {
+    let hello = b"\x16\x03\x01\x00\x4f\x01\x00\x00\x4b\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x04\xc0\x2b\xc0\x2f\x01\x00\x00\x1e\x00\x0a\x00\x04\x00\x02\x00\x17\x00\x0b\x00\x02\x01\x00\x00\x0d\x00\x08\x00\x06\x08\x07\x04\x03\x08\x04\x00\x17\x00\x00";
+    for require_tls13 in[false, true] {
+        let configuration = if require_tls13 {
+            tls_config().with_minimum_version(tls::Version::Tls13)
+        } else {
+            tls_config()
+        };
+        let server = tls_server(Router::new(), configuration);
+        defer {
+            let _ = server.shutdown(Duration::from_seconds(2));
+        };
+        let stream = transport_connect(server);
+        defer {
+            let _ = stream.close();
+        };
+        testing::assert_ok(stream.write_all_with(hello.as_slice(), transport_wait()));
+        let record = Vec::from_array([0.to_u8(); 7]);
+        testing::assert_ok(stream.read_exact_with(record.as_mut_slice(), transport_wait()));
+        if require_tls13 {
+            testing::assert_eq(record[0], 21.to_u8());
+            testing::assert_eq(record[5], 2.to_u8());
+            testing::assert_eq(record[6], 70.to_u8());
+        } else {
+            testing::assert_eq(record[0], 22.to_u8());
+            testing::assert_eq(record[5], 2.to_u8());
+        }
+        testing::assert_ok(server.shutdown(Duration::from_seconds(2)));
+    }
+}

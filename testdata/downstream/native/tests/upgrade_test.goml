@@ -5,14 +5,10 @@ use ecosystem::websocket as ws;
 use ecosystem::request;
 use std::bytes::{Bytes};
 use std::context;
-use std::ffi;
 use std::net::tls;
 use std::net::{SocketAddr};
 use std::testing;
 use std::time::{Duration, Timer};
-
-#[go_ffi("example.com/goml-ecosystem/web/testcert", "Generate")]
-extern fn test_certificate() -> (ffi::RawSlice[byte], ffi::RawSlice[byte], ffi::Error);
 
 fn upgrade_router() -> web::Router {
     web::Router::new().get(
@@ -125,10 +121,7 @@ fn websocket_invalid_handshake_is_http_error_and_dispatch_rejects_upgrade() -> (
 
 #[test]
 fn tls_listener_verifies_certificate_serves_http_and_upgrades_websocket() -> () {
-    let (certificate, key, error) = test_certificate();
-    testing::assert(ffi::error_is_nil(error));
-    let certificate = Bytes::from_vec(ffi::slice_to_vec_copy(certificate));
-    let key = Bytes::from_vec(ffi::slice_to_vec_copy(key));
+    let (certificate, key) = test_certificate();
     let router = upgrade_router().get("/", |_| Result::Ok(web::Response::text(200, "secure")));
     let server = testing::expect_ok(
         router.serve_tls(
@@ -198,9 +191,7 @@ fn upgrade_receive[T](channel: Channel[T]) -> T {
 
 #[test]
 fn tls_websocket_cancellation_interrupts_a_blocked_write() -> () {
-    let (certificate, key, error) = test_certificate();
-    testing::assert(ffi::error_is_nil(error));
-    let certificate = Bytes::from_vec(ffi::slice_to_vec_copy(certificate));
+    let (certificate, key) = test_certificate();
     let cancellation: Channel[context::CancelHandle] = Channel::new(1);
     let completed = Channel::new(1);
     let payload = Bytes::from_string("x".repeat(65536));
@@ -234,10 +225,7 @@ fn tls_websocket_cancellation_interrupts_a_blocked_write() -> () {
         },
     );
     let server = testing::expect_ok(
-        router.serve_tls(
-            "127.0.0.1:0",
-            web::TlsConfig::new(certificate, Bytes::from_vec(ffi::slice_to_vec_copy(key))),
-        ),
+        router.serve_tls("127.0.0.1:0", web::TlsConfig::new(certificate, key)),
         "TLS cancellation server",
     );
     defer {

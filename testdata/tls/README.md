@@ -1,0 +1,1 @@
+This public test-only Ed25519 key and self-signed certificate cover `localhost`, `127.0.0.1` and `::1`. The certificate is valid from 2000-01-01 through 2100-01-01 and permits TLS server authentication. Tests explicitly trust this certificate as their local CA. These fixed fixtures remove runtime certificate generation and test Go FFI.

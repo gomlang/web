@@ -4,7 +4,6 @@ use ecosystem::web;
 use ecosystem::request;
 use std::bytes::{Bytes};
 use std::context;
-use std::ffi;
 use std::io;
 use std::net::{SocketAddr};
 use std::net::tls;
@@ -23,14 +22,9 @@ fn rejection_headers() -> string {
 }
 
 fn rejection_tls_server() -> (web::Server, Bytes) {
-    let (certificate, key, error) = test_certificate();
-    testing::assert(ffi::error_is_nil(error));
-    let certificate = Bytes::from_vec(ffi::slice_to_vec_copy(certificate));
+    let (certificate, key) = test_certificate();
     let server = testing::expect_ok(
-        rejection_router().serve_tls(
-            "127.0.0.1:0",
-            web::TlsConfig::new(certificate, Bytes::from_vec(ffi::slice_to_vec_copy(key))),
-        ),
+        rejection_router().serve_tls("127.0.0.1:0", web::TlsConfig::new(certificate, key)),
         "TLS rejection server",
     );
     (server, certificate)

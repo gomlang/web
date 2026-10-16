@@ -4,8 +4,6 @@ use ecosystem::request;
 use ecosystem::web;
 use ecosystem::web::proxy;
 use ecosystem::web::testing::{TestServer};
-use std::bytes::{Bytes};
-use std::ffi;
 use std::testing;
 use std::time::{Duration};
 
@@ -33,10 +31,7 @@ fn tls_reverse_proxy_forwards_the_transport_scheme_instead_of_spoofed_headers() 
         proxy::Proxy::new(backend.base_url(), outbound, 1024, 1024),
         "proxy",
     );
-    let (certificate, key, error) = test_certificate();
-    testing::assert(ffi::error_is_nil(error));
-    let certificate = Bytes::from_vec(ffi::slice_to_vec_copy(certificate));
-    let key = Bytes::from_vec(ffi::slice_to_vec_copy(key));
+    let (certificate, key) = test_certificate();
     let frontend = testing::expect_ok(
         web::Router::new().fallback(forwarding.handler()).serve_tls(
             "127.0.0.1:0",

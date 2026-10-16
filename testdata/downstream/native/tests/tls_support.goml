@@ -1,0 +1,18 @@
+package tests;
+
+use std::bytes::{Bytes};
+use std::fs;
+use std::testing;
+
+fn test_certificate() -> (Bytes, Bytes) {
+    (
+        testing::expect_ok(
+            fs::read_bytes_structured("../../tls/certificate.pem"),
+            "TLS certificate",
+        ),
+        testing::expect_ok(
+            fs::read_bytes_structured("../../tls/private_key.pem"),
+            "TLS private key",
+        ),
+    )
+}
