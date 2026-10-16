@@ -16,7 +16,7 @@ requests can still omit Host.
 
 ## Using the library
 
-GoML [0.1.61](https://github.com/gomlang/goml/releases/tag/v0.1.61) or newer is required. This release provides the public `std::net::tls` pending-accept, explicit-handshake, stream-address and abort APIs used by the server.
+GoML [0.1.62](https://github.com/gomlang/goml/releases/tag/v0.1.62) or newer is required. This release provides the public `std::net::tls` pending-accept, explicit-handshake, stream-address and abort APIs used by the server.
 
 Declare an unversioned registry dependency:
 
@@ -380,7 +380,7 @@ The handler receives the existing WebSocket connection API and a request context
 
 ## Development and downstream checks
 
-Use GoML 0.1.61 or newer. The independent GoML fixture is in `testdata/downstream/native/`; it retains a separate manifest and resolves the library through the isolated registry. From the library root, run:
+Use GoML 0.1.62 or newer. The independent GoML fixture is in `testdata/downstream/native/`; it retains a separate manifest and resolves the library through the isolated registry. From the library root, run:
 
 ```sh
 (cd ../workflows && just ecosystem-test --goml ../../goml/stage2/bin/goml web)
