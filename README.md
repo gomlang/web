@@ -1,6 +1,6 @@
 # web
 
-`ecosystem::web` is an HTTP server framework with GoML routing, typed extraction, middleware, response construction and server-sent events. HTTP parsing, TCP transport, body streams, deadlines and server shutdown use `std::net` and `std::context`. The TLS listener uses a managed Go standard-library adapter; no cgo or third-party Go dependencies are required.
+`ecosystem::web` is an HTTP server framework with GoML routing, typed extraction, middleware, response construction and server-sent events. HTTP parsing, TCP transport, body streams, deadlines and server shutdown use `std::net` and `std::context`. TLS listeners use the public `std::net::tls` API. The repository contains only GoML implementation and test sources, with no Go adapter or native module configuration.
 
 The design takes inspiration from [Axum](https://docs.rs/axum/latest/axum/). It adapts the handler model to GoML closures and garbage collection, rather than reproducing Rust ownership or async futures. The transport supports HTTP/1.1 keepalive, chunked bodies, pipelined requests and `100 Continue`.
 
@@ -16,8 +16,7 @@ requests can still omit Host.
 
 ## Using the library
 
-Use [the pinned ecosystem toolchain](https://github.com/gomlang/workflows/blob/main/ci/toolchain.json), with unversioned registry support and the `std::panic` API
-and panic-safe lexical cleanup required by handler isolation.
+GoML [0.1.61](https://github.com/gomlang/goml/releases/tag/v0.1.61) or newer is required. This release provides the public `std::net::tls` pending-accept, explicit-handshake, stream-address and abort APIs used by the server.
 
 Declare an unversioned registry dependency:
 
@@ -26,7 +25,7 @@ Declare an unversioned registry dependency:
 "ecosystem::web" = true
 ```
 
-Consumers supply a minimal `go.mod`, as shown in `testdata/downstream/native/go.mod`. They do not need a native dependency declaration or handwritten Go `require` or `replace` entries. The native downstream fixture under `testdata/downstream/native` exercises the dependency boundary.
+Consumers need only a GoML manifest; no `go.mod` or native dependency declaration is required. The independent GoML fixture under `testdata/downstream/native` exercises the registry dependency boundary.
 
 ```goml
 use ecosystem::web::{Router, Response};
@@ -329,10 +328,10 @@ HTTP/2 and HTTP/3 remain unsupported. WebSocket upgrade is an explicit response 
 Run from this library repository:
 
 ```sh
-(cd ../workflows && just ecosystem-test web)
+(cd ../workflows && just ecosystem-test --goml ../../goml/stage2/bin/goml web)
 ```
 
-GoML black-box tests, native downstream tests and cached rebuild checks cover
+GoML black-box tests, independent downstream tests and cached rebuild checks cover
 routing, typed payloads, request/body limits and lifecycle.
 The downstream fixture sends 120 generated Unicode query/form requests through
 `ecosystem::request`, exercises concurrent requests and checks real HTTP status
@@ -348,7 +347,7 @@ under the race detector.
 
 `Router::serve_tls(address, TlsConfig::new(certificate_pem, private_key_pem))` starts an HTTPS listener with the same routing, streaming responses, limits and graceful shutdown behavior as `serve`. PEM inputs are `std::bytes::Bytes`; invalid certificates and keys fail before a listener is published. `with_minimum_version(tls::Version::Tls13)` raises the default TLS 1.2 minimum. `with_handshake_timeout(Duration)` controls each connection's positive handshake deadline (default ten seconds). Handshakes run per connection, so a stalled client does not block acceptance of other clients. ALPN advertises `http/1.1`.
 
-The TLS transport uses this module's Go standard-library adapter in `adapter/`; HTTP parsing and routing remain GoML code. Cancelling a context during a TLS read or write closes that connection and interrupts blocked transport work. Go 1.26 is required, with no cgo or third-party Go dependencies. The manifest's `[native]` declaration lets the driver select the adapter through a generated module file. Consumers must supply a minimal `go.mod`, as shown in `testdata/downstream/native/go.mod`; the driver leaves that file unchanged. The native transport's race tests run with `go test -race ./adapter`.
+The transport uses `std::net::tls::{ServerConfig, TlsListener, TlsStream}`. Pending accepts keep handshakes independent, and peer addresses remain available to handlers and rate limiting. Cancelling a context during a TLS read or write closes that connection and interrupts blocked transport work. Shutdown uses the stream’s explicit `abort()` operation to interrupt sockets immediately. GoML TLS integration tests cover certificate validation, TLS 1.3, ALPN, peer addresses, stalled and failed handshakes, cancellation and graceful/forced shutdown. Fixed PEM fixtures in `testdata/tls` replace runtime certificate generation. The same tests run under the race detector; no test Go module or Go FFI is needed.
 
 ### WebSocket upgrades
 
@@ -381,11 +380,10 @@ The handler receives the existing WebSocket connection API and a request context
 
 ## Development and downstream checks
 
-Requires a current GoML toolchain supporting unversioned registry dependencies; see [the pinned ecosystem toolchain](https://github.com/gomlang/workflows/blob/main/ci/toolchain.json). The independent native fixture is in `testdata/downstream/native/`; it retains a separate manifest and Go module for native dependencies. From the library root, run:
+Use GoML 0.1.61 or newer. The independent GoML fixture is in `testdata/downstream/native/`; it retains a separate manifest and resolves the library through the isolated registry. From the library root, run:
 
 ```sh
-goml test
-(cd ../workflows && just ecosystem-test web)
+(cd ../workflows && just ecosystem-test --goml ../../goml/stage2/bin/goml web)
 ```
 
 The ecosystem verifier builds and tests the fixture against an isolated registry snapshot and runs the library-specific smoke and compatibility checks.

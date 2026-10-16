@@ -9,6 +9,3 @@ path = "ecosystem::web"
 "ecosystem::http" = true
 "ecosystem::request" = true
 "ecosystem::textproto" = true
-
-[native]
-go-module = "example.com/goml-ecosystem/web"
